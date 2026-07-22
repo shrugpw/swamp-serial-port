@@ -1,0 +1,516 @@
+/**
+ * Unit tests for @shrug/serial-port.
+ *
+ * Drives the hardware-agnostic protocol logic (drainUntil / execOn / loginOn)
+ * against a scripted fake SerialPort and a fake Clock — NO device required.
+ *
+ * Run: `~/.swamp/deno/deno test extensions/models/serial_port_test.ts`
+ *
+ * @module
+ */
+import { assertEquals, assertMatch, assertThrows } from "jsr:@std/assert@1";
+import {
+  assertAllowedDevice,
+  ByteQueue,
+  type Clock,
+  drainUntil,
+  execOn,
+  framingArgs,
+  isAllowedDevice,
+  isPermissionError,
+  loginOn,
+  makeDirectTransport,
+  makeSubprocessTransport,
+  mergeConfig,
+  scrubSecret,
+  selectTransport,
+  sendLine,
+  type SerialPort,
+  stripEchoedCommand,
+} from "./serial_port.ts";
+
+// ── Fakes ───────────────────────────────────────────────────────────────────
+
+/** A deterministic clock; time only moves when we advance it. */
+class FakeClock implements Clock {
+  ms = 0;
+  now(): number {
+    return this.ms;
+  }
+  sleep(ms: number): Promise<void> {
+    this.ms += ms;
+    return Promise.resolve();
+  }
+  advance(ms: number): void {
+    this.ms += ms;
+  }
+}
+
+/**
+ * A scripted serial port. Returns each queued chunk on successive reads, then
+ * reports "no data" (0). Every read advances the clock, modelling syscall time
+ * so idle/max timers make progress. `infinite` repeats the last chunk forever
+ * (for max-cap tests). Records everything written.
+ */
+class FakePort implements SerialPort {
+  writes: string[] = [];
+  closed = false;
+  private i = 0;
+  private enc = new TextEncoder();
+  private dec = new TextDecoder();
+  constructor(
+    private chunks: string[],
+    private clock: FakeClock,
+    private opts: { readCostMs?: number; infinite?: boolean } = {},
+  ) {}
+  write(bytes: Uint8Array): Promise<number> {
+    this.writes.push(this.dec.decode(bytes));
+    return Promise.resolve(bytes.length);
+  }
+  read(buf: Uint8Array): Promise<number | null> {
+    this.clock.advance(this.opts.readCostMs ?? 10);
+    let chunk: string | undefined;
+    if (this.i < this.chunks.length) chunk = this.chunks[this.i++];
+    else if (this.opts.infinite) chunk = this.chunks[this.chunks.length - 1];
+    if (chunk === undefined) return Promise.resolve(0);
+    const bytes = this.enc.encode(chunk);
+    buf.set(bytes.subarray(0, buf.length));
+    return Promise.resolve(Math.min(bytes.length, buf.length));
+  }
+  close(): void {
+    this.closed = true;
+  }
+}
+
+// ── framingArgs ─────────────────────────────────────────────────────────────
+
+Deno.test("framingArgs — 8N1 is cs8 no-parity 1-stop", () => {
+  assertEquals(framingArgs("8N1"), ["cs8", "-parenb", "-cstopb"]);
+});
+
+Deno.test("framingArgs — 7E1 enables even parity", () => {
+  assertEquals(framingArgs("7E1"), ["cs7", "parenb", "-parodd", "-cstopb"]);
+});
+
+Deno.test("framingArgs — 7O2 is odd parity, 2 stop bits", () => {
+  assertEquals(framingArgs("7O2"), ["cs7", "parenb", "parodd", "cstopb"]);
+});
+
+Deno.test("framingArgs — rejects garbage", () => {
+  assertThrows(() => framingArgs("9Z3"), Error, "Invalid framing");
+});
+
+// ── device allow-list ───────────────────────────────────────────────────────
+
+Deno.test("isAllowedDevice — accepts real serial tty paths", () => {
+  for (
+    const d of [
+      "/dev/ttyUSB0",
+      "/dev/ttyUSB12",
+      "/dev/ttyACM1",
+      "/dev/ttyS0",
+      "/dev/serial/by-id/usb-FTDI_A-if00-port0",
+    ]
+  ) {
+    assertEquals(isAllowedDevice(d), true, d);
+  }
+});
+
+Deno.test("isAllowedDevice — rejects non-serial and pty targets", () => {
+  for (
+    const d of [
+      "/dev/pts/3",
+      "/dev/console",
+      "/dev/tty",
+      "/etc/passwd",
+      "ttyUSB0",
+      "",
+      "/dev/ttyUSB0; rm -rf /",
+      // Path traversal via the serial/ branch must NOT escape /dev.
+      "/dev/serial/../../etc/shadow",
+      "/dev/serial/./../../root/.ssh/authorized_keys",
+    ]
+  ) {
+    assertEquals(isAllowedDevice(d), false, d);
+  }
+});
+
+Deno.test("assertAllowedDevice — throws on a pty (login password exfil guard)", () => {
+  assertThrows(
+    () => assertAllowedDevice("/dev/pts/7"),
+    Error,
+    "Refusing device",
+  );
+});
+
+// ── mergeConfig precedence ──────────────────────────────────────────────────
+
+Deno.test("mergeConfig — arg > port resource > global", () => {
+  const g = {
+    device: "/dev/ttyUSB0",
+    baud: 115200,
+    framing: "8N1",
+    lineEnding: "\n",
+    transport: "auto" as const,
+  };
+  const resource = { baud: 9600, framing: "7E1", lineEnding: "\r" };
+  // No args: inherit everything from the establish-recorded resource.
+  assertEquals(mergeConfig(g, resource, {}), {
+    device: "/dev/ttyUSB0",
+    baud: 9600,
+    framing: "7E1",
+    lineEnding: "\r",
+  });
+  // Arg wins over resource; unset fields still inherit the resource.
+  assertEquals(mergeConfig(g, resource, { baud: 57600 }), {
+    device: "/dev/ttyUSB0",
+    baud: 57600,
+    framing: "7E1",
+    lineEnding: "\r",
+  });
+  // No resource: fall back to the global defaults (PortConfig subset only).
+  assertEquals(mergeConfig(g, null, {}), {
+    device: "/dev/ttyUSB0",
+    baud: 115200,
+    framing: "8N1",
+    lineEnding: "\n",
+  });
+});
+
+// ── ByteQueue (subprocess reader plumbing) ──────────────────────────────────
+
+Deno.test("ByteQueue — splits a chunk larger than the read buffer", () => {
+  const q = new ByteQueue();
+  q.push(new Uint8Array([1, 2, 3, 4, 5]));
+  assertEquals(q.length, 5);
+  const buf = new Uint8Array(2);
+  assertEquals(q.take(buf), 2);
+  assertEquals([...buf], [1, 2]);
+  assertEquals(q.take(buf), 2);
+  assertEquals([...buf], [3, 4]);
+  assertEquals(q.take(buf), 1);
+  assertEquals(buf[0], 5);
+  assertEquals(q.length, 0);
+  assertEquals(q.take(buf), 0); // drained
+});
+
+Deno.test("ByteQueue — coalesces across multiple chunks into one read", () => {
+  const q = new ByteQueue();
+  q.push(new Uint8Array([1, 2]));
+  q.push(new Uint8Array([3, 4]));
+  q.push(new Uint8Array([5]));
+  const buf = new Uint8Array(4);
+  assertEquals(q.take(buf), 4);
+  assertEquals([...buf], [1, 2, 3, 4]);
+  const buf2 = new Uint8Array(4);
+  assertEquals(q.take(buf2), 1);
+  assertEquals(buf2[0], 5);
+});
+
+Deno.test("ByteQueue — ignores empty pushes, take on empty is 0", () => {
+  const q = new ByteQueue();
+  q.push(new Uint8Array([]));
+  assertEquals(q.length, 0);
+  assertEquals(q.take(new Uint8Array(8)), 0);
+});
+
+// ── transport selection ─────────────────────────────────────────────────────
+
+Deno.test("selectTransport — each mode yields a configure+open transport", () => {
+  for (const mode of ["auto", "direct", "subprocess"] as const) {
+    const t = selectTransport(mode);
+    assertEquals(typeof t.configure, "function", mode);
+    assertEquals(typeof t.open, "function", mode);
+  }
+  // direct and subprocess are distinct implementations.
+  const a = makeDirectTransport();
+  const b = makeSubprocessTransport();
+  assertEquals(a.open === b.open, false);
+});
+
+Deno.test("isPermissionError — detects Deno permission denials", () => {
+  assertEquals(isPermissionError(new Deno.errors.PermissionDenied("x")), true);
+  assertEquals(
+    isPermissionError(
+      new Error(
+        'Requires all access to "/dev/ttyUSB0", specify ... --allow-all',
+      ),
+    ),
+    true,
+  );
+  assertEquals(isPermissionError(new Error("some other failure")), false);
+});
+
+// ── drainUntil ──────────────────────────────────────────────────────────────
+
+Deno.test("drainUntil — captures data then stops on idle", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["hello ", "world"], clock);
+  const { output, matched } = await drainUntil(
+    port,
+    { idleMs: 300, maxMs: 5000 },
+    clock,
+  );
+  assertEquals(output, "hello world");
+  assertEquals(matched, false);
+});
+
+Deno.test("drainUntil — stops early when stopRegex matches", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["Linux device\n", "[operator@device ~]$ "], clock);
+  const { output, matched } = await drainUntil(
+    port,
+    { idleMs: 300, maxMs: 5000, stopRegex: /\$ $/ },
+    clock,
+  );
+  assertMatch(output, /\$ $/);
+  assertEquals(matched, true);
+});
+
+Deno.test("drainUntil — banner '#'/'$' chars do NOT trigger the default prompt", async () => {
+  const clock = new FakeClock();
+  // A hash-box MOTD dribbles in before the real shell prompt. The default
+  // prompt regex requires a trailing space, so the box lines must NOT stop it.
+  const port = new FakePort(
+    [
+      "#############\n",
+      "# Banana Pi #\n",
+      "#############\n",
+      "[operator@device ~]$ ",
+    ],
+    clock,
+  );
+  const { output, matched } = await drainUntil(
+    port,
+    { idleMs: 300, maxMs: 5000, stopRegex: /[$#>] $/ },
+    clock,
+  );
+  assertEquals(matched, true);
+  // Proof it read PAST the banner rather than stopping on a '#'.
+  assertMatch(output, /Banana Pi/);
+  assertMatch(output, /\$ $/);
+});
+
+Deno.test("drainUntil — honours the max cap on a chatty port", async () => {
+  const clock = new FakeClock();
+  // Never idles (infinite data), never matches; must break on maxMs.
+  const port = new FakePort(["....."], clock, {
+    infinite: true,
+    readCostMs: 50,
+  });
+  const { matched } = await drainUntil(
+    port,
+    { idleMs: 300, maxMs: 1000, stopRegex: /NEVER/ },
+    clock,
+  );
+  assertEquals(matched, false);
+  assertEquals(clock.now() >= 1000, true);
+});
+
+Deno.test("drainUntil — empty port returns empty without spinning", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  const { output } = await drainUntil(
+    port,
+    { idleMs: 200, maxMs: 5000 },
+    clock,
+  );
+  assertEquals(output, "");
+  // Idle reached via bounded sleeps, not an unbounded spin.
+  assertEquals(clock.now() >= 200, true);
+});
+
+// ── sendLine ────────────────────────────────────────────────────────────────
+
+Deno.test("sendLine — appends the configured line ending", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  const n = await sendLine(port, "uname -a", {
+    lineEnding: "\n",
+    appendNewline: true,
+  });
+  assertEquals(port.writes, ["uname -a\n"]);
+  assertEquals(n, "uname -a\n".length);
+});
+
+Deno.test("sendLine — raw send omits the line ending", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  await sendLine(port, "\x03", { lineEnding: "\n", appendNewline: false });
+  assertEquals(port.writes, ["\x03"]);
+});
+
+Deno.test("sendLine — respects a carriage-return line ending", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  await sendLine(port, "ls", { lineEnding: "\r", appendNewline: true });
+  assertEquals(port.writes, ["ls\r"]);
+});
+
+// ── stripEchoedCommand ──────────────────────────────────────────────────────
+
+Deno.test("stripEchoedCommand — removes the leading echoed line", () => {
+  const out = stripEchoedCommand("uname -a\r\nLinux device\r\n", "uname -a");
+  assertEquals(out, "Linux device\r\n");
+});
+
+Deno.test("stripEchoedCommand — clears a CR-CR-LF residue (CR line ending)", () => {
+  // With lineEnding "\r" the device echoes "ls\r" then "\r\nfile1"; the whole
+  // leading CR/LF run must be stripped, not just a single "\r?\n".
+  const out = stripEchoedCommand("ls\r\r\nfile1\r\n", "ls");
+  assertEquals(out, "file1\r\n");
+});
+
+Deno.test("stripEchoedCommand — leaves output without an echo intact", () => {
+  const out = stripEchoedCommand("Linux device\r\n", "uname -a");
+  assertEquals(out, "Linux device\r\n");
+});
+
+// ── execOn ──────────────────────────────────────────────────────────────────
+
+Deno.test("execOn — sends command, strips echo, stops on prompt", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(
+    ["uname -a\r\n", "Linux device 6.1.0 riscv64\r\n", "[operator@device ~]$ "],
+    clock,
+  );
+  const { output, matchedPrompt } = await execOn(
+    port,
+    {
+      command: "uname -a",
+      lineEnding: "\n",
+      prompt: /\$ $/,
+      idleMs: 500,
+      maxMs: 10000,
+      stripEcho: true,
+    },
+    clock,
+  );
+  assertEquals(port.writes[0], "uname -a\n");
+  assertMatch(output, /^Linux device 6\.1\.0 riscv64/);
+  assertEquals(matchedPrompt, true);
+});
+
+Deno.test("execOn — keeps the echo when stripEcho is false", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["echo hi\r\nhi\r\n"], clock);
+  const { output } = await execOn(
+    port,
+    {
+      command: "echo hi",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+      stripEcho: false,
+    },
+    clock,
+  );
+  assertMatch(output, /^echo hi/);
+});
+
+// ── scrubSecret ─────────────────────────────────────────────────────────────
+
+Deno.test("scrubSecret — redacts the password wherever it appears", () => {
+  assertEquals(scrubSecret("pw=hunter2 done", "hunter2"), "pw=«redacted» done");
+});
+
+Deno.test("scrubSecret — no-op when no secret given", () => {
+  assertEquals(scrubSecret("nothing here", undefined), "nothing here");
+});
+
+// ── loginOn ─────────────────────────────────────────────────────────────────
+
+Deno.test("loginOn — full getty flow succeeds and hides the password", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(
+    [
+      "\r\ndevice login: ",
+      "Password: ",
+      "\r\nLast login: ...\r\n[operator@device ~]$ ",
+    ],
+    clock,
+  );
+  const { status, transcript } = await loginOn(
+    port,
+    {
+      username: "operator",
+      password: "hunter2",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(status, "ok");
+  assertEquals(port.writes, ["\n", "operator\n", "hunter2\n"]);
+  // Password must never leak into the recorded transcript.
+  assertEquals(transcript.includes("hunter2"), false);
+});
+
+Deno.test("loginOn — status is decided before scrubbing (password with '$')", async () => {
+  const clock = new FakeClock();
+  // The remote does not echo the password, but the prompt char '$' also happens
+  // to be in the password; scrubbing must not delete the prompt from the
+  // decision. Status is computed on the raw transcript, so it stays "ok".
+  const port = new FakePort(
+    ["\r\ndevice login: ", "Password: ", "\r\n[operator@device ~]$ "],
+    clock,
+  );
+  const { status, transcript } = await loginOn(
+    port,
+    {
+      username: "operator",
+      password: "p$ss",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(status, "ok");
+  assertEquals(transcript.includes("p$ss"), false);
+});
+
+Deno.test("loginOn — already at a shell prompt is ok without logging in", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["\r\n[operator@device ~]$ "], clock);
+  const { status } = await loginOn(
+    port,
+    {
+      username: "operator",
+      password: "hunter2",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(status, "ok");
+  // Only the nudge newline — no username/password sent.
+  assertEquals(port.writes, ["\n"]);
+});
+
+Deno.test("loginOn — wrong credentials report failed", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(
+    [
+      "\r\ndevice login: ",
+      "Password: ",
+      "\r\nLogin incorrect\r\n\r\ndevice login: ",
+    ],
+    clock,
+  );
+  const { status, transcript } = await loginOn(
+    port,
+    {
+      username: "operator",
+      password: "wrong",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(status, "failed");
+  assertMatch(transcript, /Login incorrect/);
+});

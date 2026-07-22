@@ -1,0 +1,25 @@
+manifestVersion: 1
+name: "@shrug/serial-port"
+version: "2026.07.22.1"
+description: "USB-UART serial-console model: establish/send/read/exec/login over a serial device (e.g. /dev/ttyUSB0). Line config via stty(1); byte I/O via a direct Deno.open fd or a dd/cat subprocess fallback (auto). Device paths are allowlisted so login's vaulted password can't be written to an arbitrary terminal."
+
+repository: https://github.com/shrugpw/swamp-serial-port
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+models:
+  - serial_port.ts
+
+# Shells out to stty(1)/dd/cat and matches Linux device paths (/dev/ttyUSB* etc),
+# so it targets Linux hosts.
+platforms:
+  - linux-x86_64
+  - linux-aarch64
+
+labels:
+  - serial
+  - uart
+  - console
+  - hardware
