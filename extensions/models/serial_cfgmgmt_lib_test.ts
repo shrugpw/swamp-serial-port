@@ -13,9 +13,12 @@ import { assertEquals } from "jsr:@std/assert@1";
 import {
   cleanOutput,
   type CommandResult,
+  RC_RE,
   type Session,
+  settle,
   splitExitCode,
 } from "./serial_cfgmgmt_lib.ts";
+import { type Clock, execOn, type SerialPort } from "./serial_port.ts";
 import { gatherFacts } from "./serial_cfgmgmt_node.ts";
 import {
   detectManager,
@@ -44,6 +47,57 @@ function fakeSession(
 }
 
 const ok = (stdout: string): CommandResult => ({ stdout, exitCode: 0 });
+
+/** A deterministic clock; time only moves when we advance it. */
+class FakeClock implements Clock {
+  ms = 0;
+  now(): number {
+    return this.ms;
+  }
+  sleep(ms: number): Promise<void> {
+    this.ms += ms;
+    return Promise.resolve();
+  }
+  advance(ms: number): void {
+    this.ms += ms;
+  }
+}
+
+/**
+ * A scripted serial port (same shape as serial_port_test's fake): returns each
+ * queued chunk on successive reads, then reports "no data" (0). Every read
+ * advances the clock so idle/max timers make progress. `infinite` repeats the
+ * last chunk forever. Records everything written.
+ */
+class FakePort implements SerialPort {
+  writes: string[] = [];
+  closed = false;
+  private i = 0;
+  private enc = new TextEncoder();
+  private dec = new TextDecoder();
+  constructor(
+    private chunks: string[],
+    private clock: FakeClock,
+    private opts: { readCostMs?: number; infinite?: boolean } = {},
+  ) {}
+  write(bytes: Uint8Array): Promise<number> {
+    this.writes.push(this.dec.decode(bytes));
+    return Promise.resolve(bytes.length);
+  }
+  read(buf: Uint8Array): Promise<number | null> {
+    this.clock.advance(this.opts.readCostMs ?? 10);
+    let chunk: string | undefined;
+    if (this.i < this.chunks.length) chunk = this.chunks[this.i++];
+    else if (this.opts.infinite) chunk = this.chunks[this.chunks.length - 1];
+    if (chunk === undefined) return Promise.resolve(0);
+    const bytes = this.enc.encode(chunk);
+    buf.set(bytes.subarray(0, buf.length));
+    return Promise.resolve(Math.min(bytes.length, buf.length));
+  }
+  close(): void {
+    this.closed = true;
+  }
+}
 
 // ── cleanOutput ──────────────────────────────────────────────────────────────
 
@@ -74,6 +128,79 @@ Deno.test("splitExitCode extracts the RC sentinel and strips it from stdout", ()
   assertEquals(splitExitCode("no sentinel here"), {
     stdout: "no sentinel here",
     exitCode: null,
+  });
+});
+
+Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", () => {
+  // A prompt left un-drained by loginOn glues onto the pty echo of the next
+  // command; the real output follows. Only "fedora" should survive.
+  const raw =
+    "[fedora@bpif3-004 ~]$ id -un\r\nfedora\r\n[fedora@bpif3-004 ~]$ ";
+  assertEquals(cleanOutput(raw, "id -un"), "fedora");
+});
+
+// ── settle ───────────────────────────────────────────────────────────────────
+
+Deno.test("settle drains buffered bytes to quiet, then leaves the port empty", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["[fedora@bpif3-004 ~]$ "], clock);
+  const swept = await settle(port, { settleMs: 300, maxMs: 5000 }, clock);
+  assertEquals(swept, "[fedora@bpif3-004 ~]$ ");
+  // A second settle sees nothing — the buffer was fully consumed.
+  assertEquals(await settle(port, { settleMs: 300, maxMs: 5000 }, clock), "");
+});
+
+Deno.test("settle returns after settleMs of idle on a quiet line", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  assertEquals(await settle(port, { settleMs: 300, maxMs: 5000 }, clock), "");
+  // Idle bound reached, hard cap not hit.
+  assertEquals(clock.now() < 5000, true);
+});
+
+Deno.test("settle stops at maxMs on a console that never goes quiet", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["printk noise "], clock, { infinite: true });
+  const swept = await settle(port, { settleMs: 300, maxMs: 1000 }, clock);
+  assertEquals(swept.length > 0, true);
+  assertEquals(clock.now() >= 1000, true); // bounded, did not hang
+});
+
+// ── sentinel-synced read ─────────────────────────────────────────────────────
+
+Deno.test("RC-synced read skips a residual prompt and stops on the sentinel", async () => {
+  const clock = new FakeClock();
+  const cmd = 'id -un; echo "__RC:$?:RC__"';
+  // Buffer opens with a STALE prompt (what loginOn strands). A prompt stop-regex
+  // would false-match it and return empty; RC_RE must read through to the real
+  // sentinel. Note the pty echo carries a literal "$?" (no digit), so RC_RE
+  // skips it and matches only the executed "__RC:0:RC__".
+  const port = new FakePort(
+    [
+      "[fedora@bpif3-004 ~]$ ", // residual prompt (stale)
+      `${cmd}\r\n`, // pty echo of the wrapped command
+      "fedora\r\n", // real output
+      "__RC:0:RC__\r\n", // sentinel (digit → matches)
+      "[fedora@bpif3-004 ~]$ ", // trailing prompt (should stay unread)
+    ],
+    clock,
+  );
+  const { output, matchedPrompt } = await execOn(
+    port,
+    {
+      command: cmd,
+      lineEnding: "\n",
+      prompt: RC_RE,
+      idleMs: 1000,
+      maxMs: 15000,
+      stripEcho: true,
+    },
+    clock,
+  );
+  assertEquals(matchedPrompt, true);
+  assertEquals(splitExitCode(cleanOutput(output, cmd)), {
+    stdout: "fedora",
+    exitCode: 0,
   });
 });
 

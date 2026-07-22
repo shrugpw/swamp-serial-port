@@ -23,6 +23,8 @@
 import { z } from "npm:zod@4";
 import {
   assertAllowedDevice,
+  type Clock,
+  drainUntil,
   execOn,
   loginOn,
   type SerialPort,
@@ -39,8 +41,14 @@ export const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 /** Matches the trailing shell-prompt line after right-trim (…`~]$`, `#`, `>`). */
 const PROMPT_LINE_RE = /[#$>]\s*$/;
 
-/** Exit-code sentinel appended to every command so we can read `$?` over serial. */
-const RC_RE = /__RC:(-?\d+):RC__/;
+/**
+ * Exit-code sentinel appended to every command so we can read `$?` over serial.
+ * Also serves as the read **stop condition**: it requires a real digit, so it
+ * matches only the executed `echo` output — never the pty-echoed command line,
+ * which still carries a literal `$?`. That gives a per-command sync point that a
+ * stale ambient prompt cannot false-match.
+ */
+export const RC_RE = /__RC:(-?\d+):RC__/;
 
 /**
  * Connection + credential global arguments shared by every serial-cfgmgmt type.
@@ -72,10 +80,13 @@ export const ConnectionGlobals = {
     "Login password, resolved from a vault reference (never a literal). Required to log in a getty.",
   ),
   idleMs: z.number().int().positive().max(60_000).default(1000).describe(
-    "Stop a command read after this many ms with no new bytes.",
+    "Stop a command read after this many ms with no new bytes (fallback bound; commands normally stop on their output sentinel).",
   ),
   maxMs: z.number().int().positive().max(600_000).default(15_000).describe(
     "Hard cap on a single command's read time.",
+  ),
+  settleMs: z.number().int().min(0).max(60_000).default(0).describe(
+    "Before the first command, drain the console to quiet for this many ms and discard stale buffered output (residual login/shell prompt, MOTD tail, late printk). 0 disables — commands already synchronize on their `__RC:<n>:RC__` output sentinel, so a settle is only insurance for the login preamble.",
   ),
 };
 
@@ -121,7 +132,14 @@ export function cleanOutput(
   for (const line of lines) {
     const t = line.trim();
     // Drop the echoed command (possibly the first line) and any prompt line.
-    if (t === cmd || (kept.length === 0 && t !== "" && cmd.startsWith(t))) {
+    // On the first kept line the remote may glue a preceding shell prompt onto
+    // the echo (e.g. "[u@h ~]$ id -un") when an earlier prompt was left
+    // un-drained — so on line 0 also match the command at the END of the line.
+    if (
+      t === cmd ||
+      (kept.length === 0 && t !== "" &&
+        (cmd.startsWith(t) || t.endsWith(cmd)))
+    ) {
       continue;
     }
     if (promptLineRe.test(line)) continue;
@@ -141,6 +159,30 @@ export function splitExitCode(cleaned: string): CommandResult {
     .replace(/\n[ \t]*$/, "")
     .replace(/^[ \t]*\n/, "");
   return { stdout: stdout.replace(/\s+$/, ""), exitCode };
+}
+
+/**
+ * Drain the port to quiet and discard the bytes. After a login or nudge the
+ * console can leave a stale prompt / MOTD tail / late printk buffered; sweeping
+ * it before the first command keeps that noise out of the first capture.
+ *
+ * This is *insurance*, not the primary defence: {@link withSession}'s session
+ * stops each command read on its unique `__RC:<n>:RC__` sentinel (not on the
+ * ambient prompt), so a stranded prompt no longer false-matches. Returns the
+ * discarded text for observability/tests. `clock` is injectable for tests;
+ * omit it in production to use the real clock.
+ */
+export async function settle(
+  port: SerialPort,
+  opts: { settleMs: number; maxMs: number },
+  clock?: Clock,
+): Promise<string> {
+  const { output } = await drainUntil(
+    port,
+    { idleMs: opts.settleMs, maxMs: opts.maxMs },
+    clock,
+  );
+  return output;
 }
 
 /** Effective per-call config resolved from the connection globals. */
@@ -204,14 +246,30 @@ export async function withSession<T>(
         });
       }
 
+      // Optional insurance: drain any stale buffered prompt/MOTD tail to quiet
+      // before the first command. Off by default — the sentinel-synced reads
+      // below already tolerate a stranded prompt.
+      if (g.settleMs > 0) {
+        await settle(port, {
+          settleMs: g.settleMs,
+          maxMs: Math.max(g.settleMs * 8, 2000),
+        });
+      }
+
       const session: Session = {
         run: async (command: string) => {
-          // Append a `$?` sentinel so we recover the exit code over a dumb console.
+          // Append a `$?` sentinel so we recover the exit code over a dumb
+          // console, and — crucially — stop the read on that sentinel rather
+          // than the ambient shell prompt. A residual prompt left in the buffer
+          // (e.g. by loginOn) would false-match a prompt stop-regex immediately
+          // and return before the real output; RC_RE requires an actual digit,
+          // so it matches only the executed `echo` (the pty-echoed command line
+          // still carries a literal `$?`), giving a deterministic sync point.
           const wrapped = `${command}; echo "__RC:$?:RC__"`;
           const { output } = await execOn(port, {
             command: wrapped,
             lineEnding: g.lineEnding,
-            prompt: stopRe,
+            prompt: RC_RE,
             idleMs: g.idleMs,
             maxMs: g.maxMs,
             stripEcho: true,
