@@ -69,6 +69,33 @@ without bound. Cross-instance exclusivity is a documented limitation: an externa
 holder (`screen`/`minicom`) is detected via `EBUSY`, but the model does not claim
 a `TIOCEXCL` lock itself — operate one driver per device.
 
+## Config management over serial (`serial-cfgmgmt/*`)
+
+For boards with no network, the `@shrug/serial-cfgmgmt/*` types are the
+serial-console counterpart to SSH config management (à la `@adam/cfgmgmt`). They
+share one connection-config block (`device`/`baud`/`framing`/`transport` plus an
+optional `username` + vaulted `password` that logs in a getty first) and are all
+built on the console primitive above — each command is run with a `$?` sentinel
+so exit codes survive a dumb console.
+
+| Type                          | Methods                                        |
+| ----------------------------- | ---------------------------------------------- |
+| `serial-cfgmgmt/node`         | `gather` — hostname/OS/arch/kernel/pkg-managers → `info` (same shape as `@adam/cfgmgmt/node`) |
+| `serial-cfgmgmt/exec`         | `run` — arbitrary command → stdout + exit code |
+| `serial-cfgmgmt/package`      | `query` (read); `install` (mutating)           |
+| `serial-cfgmgmt/service`      | `status` (read); `start`/`stop`/`enable`/`disable` (mutating) |
+
+```bash
+swamp model create @shrug/serial-cfgmgmt/node board --global-arg device=/dev/ttyUSB0
+# credentials only needed if the board sits at a login: prompt:
+#   --global-arg username=fedora --global-arg 'password=${{ vault.get(board, PASSWORD) }}'
+swamp model method run board gather
+swamp data get board <hostname> --json | jq .content
+```
+
+The mutating package/service methods assume a privileged (root) shell and are
+scaffolding for the broader surface — exercise them deliberately.
+
 ## License
 
 MIT — see [LICENSE.txt](LICENSE.txt).

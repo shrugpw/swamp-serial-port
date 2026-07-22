@@ -1,7 +1,7 @@
 manifestVersion: 1
 name: "@shrug/serial-port"
 version: "2026.07.22.1"
-description: "USB-UART serial-console model: establish/send/read/exec/login over a serial device (e.g. /dev/ttyUSB0). Line config via stty(1); byte I/O via a direct Deno.open fd or a dd/cat subprocess fallback (auto). Device paths are allowlisted so login's vaulted password can't be written to an arbitrary terminal."
+description: "USB-UART serial console + config management. The `serial-port` type is the raw console primitive (establish/send/read/exec/login) over a serial device (e.g. /dev/ttyUSB0); line config via stty(1), byte I/O via a direct Deno.open fd or a dd/cat subprocess fallback (auto), device paths allowlisted so login's vaulted password can't reach an arbitrary terminal. The `serial-cfgmgmt/*` types (node/exec/package/service) are the serial-console counterpart to SSH config management — for boards with no network — built on that same console primitive."
 
 repository: https://github.com/shrugpw/swamp-serial-port
 
@@ -11,6 +11,10 @@ additionalFiles:
 
 models:
   - serial_port.ts
+  - serial_cfgmgmt_node.ts
+  - serial_cfgmgmt_exec.ts
+  - serial_cfgmgmt_package.ts
+  - serial_cfgmgmt_service.ts
 
 # Shells out to stty(1)/dd/cat and matches Linux device paths (/dev/ttyUSB* etc),
 # so it targets Linux hosts.
@@ -23,3 +27,4 @@ labels:
   - uart
   - console
   - hardware
+  - cfgmgmt
