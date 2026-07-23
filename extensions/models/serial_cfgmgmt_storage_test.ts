@@ -37,6 +37,7 @@ import {
   planFormatMount,
   planRelocateSubvol,
   SAFE_LABEL_RE,
+  SAFE_MKFS_ARGS_RE,
   SAFE_OPTS_RE,
   SAFE_PATH_RE,
   type StorageFacts,
@@ -565,6 +566,11 @@ Deno.test("F4: assertSafe blocks shell metacharacters; SAFE_* regexes are strict
   assertSafe("defaults,nofail,x-systemd.device-timeout=30s", SAFE_OPTS_RE, "opts");
   assert(!SAFE_OPTS_RE.test("defaults;evil"));
   assertSafe("", SAFE_OPTS_RE, "opts"); // empty opts still allowed
+  // mkfsArgs must allow LEADING-dash flags (real mkfs options) but no metachars.
+  assertSafe("-b 4096", SAFE_MKFS_ARGS_RE, "mkfsArgs");
+  assertSafe("-O extref -m dup", SAFE_MKFS_ARGS_RE, "mkfsArgs");
+  assertThrows(() => assertSafe("-b 4096; rm -rf /", SAFE_MKFS_ARGS_RE, "mkfsArgs"));
+  assert(!SAFE_MKFS_ARGS_RE.test("$(evil)"));
 });
 
 Deno.test("F8: mergeFstab treats /mnt/x and /mnt/x/ as the same mountpoint", () => {

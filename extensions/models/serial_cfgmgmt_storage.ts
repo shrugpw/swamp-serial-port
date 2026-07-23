@@ -161,8 +161,16 @@ export type ConfirmDevice = z.infer<typeof ConfirmDeviceSchema>;
 // a command where it's a bare positional argument (e.g. `--reference=/etc/shadow`).
 export const SAFE_PATH_RE = /^[A-Za-z0-9._@:+/=][A-Za-z0-9._@:+/=-]*$/;
 export const SAFE_LABEL_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
-/** Options / mkfs-args: adds space and comma; still no `;|&$<>()\`"'\\` or leading `-`. */
+/** fstab options: space/comma allowed, no shell control chars, no leading `-`. */
 export const SAFE_OPTS_RE = /^(?:[A-Za-z0-9._@:+/=,][A-Za-z0-9._@:+/=, -]*)?$/;
+/**
+ * mkfs args: same character set but a LEADING dash IS allowed — real mkfs flags
+ * (`-b 4096`, `-O extref`, `-U <uuid>`) start with one, and this value is never
+ * the first positional token of its command (`mkfs.<fstype> [-L label] <args>
+ * <target>`), so a leading dash can't smuggle a flag into a different position.
+ * Still no shell metacharacters, so no command injection.
+ */
+export const SAFE_MKFS_ARGS_RE = /^[A-Za-z0-9._@:+/=, -]*$/;
 
 /** Throw unless `value` matches `re`; used as an in-method backstop. */
 export function assertSafe(value: string, re: RegExp, kind: string): void {
@@ -808,8 +816,8 @@ export const model = {
           "Filesystem type to create.",
         ),
         label: z.string().regex(SAFE_LABEL_RE).optional().describe("Filesystem label."),
-        mkfsArgs: z.string().regex(SAFE_OPTS_RE).optional().describe(
-          "Extra args passed to mkfs.<fstype> (no shell metacharacters).",
+        mkfsArgs: z.string().regex(SAFE_MKFS_ARGS_RE).optional().describe(
+          "Extra args passed to mkfs.<fstype>, e.g. '-b 4096' (no shell metacharacters).",
         ),
         mountpoint: z.string().min(1).regex(SAFE_PATH_RE).describe(
           "Mount path, e.g. /mnt/data.",
@@ -918,7 +926,7 @@ export const model = {
         assertSafe(args.mountpoint, SAFE_PATH_RE, "mountpoint");
         assertSafe(args.fstype, SAFE_LABEL_RE, "fstype");
         if (args.label) assertSafe(args.label, SAFE_LABEL_RE, "label");
-        if (args.mkfsArgs) assertSafe(args.mkfsArgs, SAFE_OPTS_RE, "mkfsArgs");
+        if (args.mkfsArgs) assertSafe(args.mkfsArgs, SAFE_MKFS_ARGS_RE, "mkfsArgs");
         if (args.fstabOptions) assertSafe(args.fstabOptions, SAFE_OPTS_RE, "fstabOptions");
 
         const result = await withSession(g, context.logger, async (session) => {
