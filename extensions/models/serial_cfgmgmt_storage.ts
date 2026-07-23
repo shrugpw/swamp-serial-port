@@ -140,10 +140,11 @@ export const ConfirmDeviceSchema = z.object({
   sizeBytes: z.number().optional(),
   empty: z.boolean().optional(),
 }).refine(
-  (o) => o.serial !== undefined || o.model !== undefined || o.sizeBytes !== undefined,
+  (o) =>
+    o.serial !== undefined || o.model !== undefined ||
+    o.sizeBytes !== undefined,
   {
-    message:
-      "confirmDevice must assert at least one device-unique field " +
+    message: "confirmDevice must assert at least one device-unique field " +
       "(serial, model, or sizeBytes) — `empty` alone cannot distinguish which " +
       "physical device you are touching, and would defeat verify-before-destroy.",
   },
@@ -312,8 +313,12 @@ function parseSubvolLines(
 ): Array<{ id: number; parentId?: number; path: string }> {
   const out: Array<{ id: number; parentId?: number; path: string }> = [];
   for (const l of stdout.split("\n")) {
-    const m = l.match(/^ID\s+(\d+)\s+gen\s+\d+\s+top level\s+(\d+)\s+path\s+(.+)$/);
-    if (m) out.push({ id: Number(m[1]), parentId: Number(m[2]), path: m[3].trim() });
+    const m = l.match(
+      /^ID\s+(\d+)\s+gen\s+\d+\s+top level\s+(\d+)\s+path\s+(.+)$/,
+    );
+    if (m) {
+      out.push({ id: Number(m[1]), parentId: Number(m[2]), path: m[3].trim() });
+    }
   }
   return out;
 }
@@ -360,7 +365,10 @@ export function parseBtrfs(
   // device to the fs's member devices. Dedup by id within a fs (the same subvol
   // shows up in the list for every mount of that fs, e.g. `/` and `/home`).
   for (const fs of fss) {
-    const byId = new Map<number, { id: number; parentId?: number; path: string }>();
+    const byId = new Map<
+      number,
+      { id: number; parentId?: number; path: string }
+    >();
     for (const entry of subvolLists) {
       // Match by device; if no device was supplied and there's exactly one fs,
       // fall back to attaching (single-fs boards / callers without a device).
@@ -411,7 +419,10 @@ function extractJson(
     }
     if (end >= 0) {
       try {
-        const obj = JSON.parse(raw.slice(from, end + 1)) as Record<string, unknown>;
+        const obj = JSON.parse(raw.slice(from, end + 1)) as Record<
+          string,
+          unknown
+        >;
         // Skip a stray but valid object (e.g. `{}` in prompt residue) that
         // lacks the payload key the caller expects — keep scanning for the real
         // one rather than degrading the facet to empty.
@@ -468,17 +479,23 @@ export function identityMismatches(
   const reasons: string[] = [];
   if (confirm.serial != null && dev.serial !== confirm.serial) {
     reasons.push(
-      `serial mismatch: confirmDevice=${confirm.serial} live=${dev.serial ?? "(none)"}`,
+      `serial mismatch: confirmDevice=${confirm.serial} live=${
+        dev.serial ?? "(none)"
+      }`,
     );
   }
   if (confirm.model != null && dev.model !== confirm.model) {
     reasons.push(
-      `model mismatch: confirmDevice=${confirm.model} live=${dev.model ?? "(none)"}`,
+      `model mismatch: confirmDevice=${confirm.model} live=${
+        dev.model ?? "(none)"
+      }`,
     );
   }
   if (confirm.sizeBytes != null && dev.sizeBytes !== confirm.sizeBytes) {
     reasons.push(
-      `size mismatch: confirmDevice=${confirm.sizeBytes} live=${dev.sizeBytes ?? "(unknown)"}`,
+      `size mismatch: confirmDevice=${confirm.sizeBytes} live=${
+        dev.sizeBytes ?? "(unknown)"
+      }`,
     );
   }
   // `empty` is a real bidirectional assertion: empty:true must be empty,
@@ -597,9 +614,7 @@ export function planFormatMount(
   args: FormatMountArgs,
   bp = "",
 ): { orderedCommands: string[]; fstabLine: string; target: string } {
-  const target = args.partition
-    ? partitionPath(args.device)
-    : args.device;
+  const target = args.partition ? partitionPath(args.device) : args.device;
   const cmds: string[] = [];
   if (args.wipe) cmds.push(`${bp}wipefs -a ${args.device}`);
   if (args.partition) {
@@ -707,7 +722,10 @@ export function planRelocateSubvol(
 
 /** Leading valid-hostname run, mirroring node/gather's residue-tolerant probe. */
 async function probeHost(run: Session["run"]): Promise<string> {
-  const raw = (await run("hostname")).stdout.trim().replace(/[^A-Za-z0-9.-].*$/s, "");
+  const raw = (await run("hostname")).stdout.trim().replace(
+    /[^A-Za-z0-9.-].*$/s,
+    "",
+  );
   return raw || "unknown";
 }
 
@@ -733,8 +751,11 @@ export async function collectStorage(
   const btrfsMounts = mounts.filter((m) => m.fstype === "btrfs");
   let btrfs: BtrfsFs[] = [];
   if (btrfsMounts.length) {
-    const show = (await run(`${bp}btrfs filesystem show --raw 2>/dev/null`)).stdout;
-    const subvolLists: Array<{ mount: string; device: string; stdout: string }> = [];
+    const show =
+      (await run(`${bp}btrfs filesystem show --raw 2>/dev/null`)).stdout;
+    const subvolLists: Array<
+      { mount: string; device: string; stdout: string }
+    > = [];
     for (const m of btrfsMounts) {
       // No `-o`: list ALL subvolumes of the filesystem containing this mount
       // (paths fs-root-relative). `-o` would only show subvols *below* the mount
@@ -792,7 +813,9 @@ export async function persistFstab(
   // redirect happens in the caller's shell, which isn't root under `become`);
   // pipefail in a subshell so a decode failure isn't masked by tee's success.
   const wr = await session.run(
-    `( set -o pipefail; printf '%s' '${b64encode(content)}' | base64 -d | ${bp}tee /etc/fstab > /dev/null )`,
+    `( set -o pipefail; printf '%s' '${
+      b64encode(content)
+    }' | base64 -d | ${bp}tee /etc/fstab > /dev/null )`,
   );
   if (wr.exitCode !== 0) {
     throw new Error(`could not write /etc/fstab (rc=${wr.exitCode})`);
@@ -885,7 +908,9 @@ export const model = {
         fstype: z.string().regex(SAFE_LABEL_RE).default("btrfs").describe(
           "Filesystem type to create.",
         ),
-        label: z.string().regex(SAFE_LABEL_RE).optional().describe("Filesystem label."),
+        label: z.string().regex(SAFE_LABEL_RE).optional().describe(
+          "Filesystem label.",
+        ),
         mkfsArgs: z.string().regex(SAFE_MKFS_ARGS_RE).optional().describe(
           "Extra args passed to mkfs.<fstype>, e.g. '-b 4096' (no shell metacharacters).",
         ),
@@ -998,8 +1023,12 @@ export const model = {
         assertSafe(args.mountpoint, SAFE_PATH_RE, "mountpoint");
         assertSafe(args.fstype, SAFE_LABEL_RE, "fstype");
         if (args.label) assertSafe(args.label, SAFE_LABEL_RE, "label");
-        if (args.mkfsArgs) assertSafe(args.mkfsArgs, SAFE_MKFS_ARGS_RE, "mkfsArgs");
-        if (args.fstabOptions) assertSafe(args.fstabOptions, SAFE_OPTS_RE, "fstabOptions");
+        if (args.mkfsArgs) {
+          assertSafe(args.mkfsArgs, SAFE_MKFS_ARGS_RE, "mkfsArgs");
+        }
+        if (args.fstabOptions) {
+          assertSafe(args.fstabOptions, SAFE_OPTS_RE, "fstabOptions");
+        }
 
         const result = await withSession(g, context.logger, async (session) => {
           const facts = await collectStorage((c) => session.run(c), bp);
@@ -1007,7 +1036,9 @@ export const model = {
           const guard = confirmMatches(dev, args.confirmDevice!, args.device);
           if (!guard.ok) {
             throw new Error(
-              `format_mount refused for ${args.device}: ${guard.reasons.join("; ")}`,
+              `format_mount refused for ${args.device}: ${
+                guard.reasons.join("; ")
+              }`,
             );
           }
           // dev is non-null here (guard would have failed otherwise). Refuse a
@@ -1034,13 +1065,19 @@ export const model = {
           const step = async (cmd: string) => {
             const r = await session.run(`${bp}${cmd}`);
             if (r.exitCode !== 0) {
-              throw new Error(`\`${bp}${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`);
+              throw new Error(
+                `\`${bp}${cmd}\` failed (rc=${r.exitCode}): ${
+                  r.stdout.slice(-300)
+                }`,
+              );
             }
             return r;
           };
           if (args.wipe) await step(`wipefs -a ${args.device}`);
           if (args.partition) {
-            await step(`parted -s ${args.device} mklabel gpt mkpart primary 0% 100%`);
+            await step(
+              `parted -s ${args.device} mklabel gpt mkpart primary 0% 100%`,
+            );
             await session.run(`${bp}udevadm settle 2>/dev/null; sleep 1`);
           }
           const mkfs = [`mkfs.${args.fstype}`];
@@ -1050,9 +1087,12 @@ export const model = {
           await step(mkfs.join(" "));
 
           const uuid =
-            (await step(`blkid -c /dev/null -s UUID -o value ${target}`)).stdout.trim();
+            (await step(`blkid -c /dev/null -s UUID -o value ${target}`)).stdout
+              .trim();
           if (!/^[0-9a-fA-F-]{8,}$/.test(uuid)) {
-            throw new Error(`could not read a UUID for ${target} after mkfs (got "${uuid}")`);
+            throw new Error(
+              `could not read a UUID for ${target} after mkfs (got "${uuid}")`,
+            );
           }
           await step(`mkdir -p ${args.mountpoint}`);
           const line = buildFstabLine({
@@ -1063,7 +1103,8 @@ export const model = {
           });
           const fstab = await persistFstab(session, args.mountpoint, line, bp);
           await step(`mount ${args.mountpoint}`);
-          const verify = (await step(`findmnt --real -n ${args.mountpoint}`)).stdout.trim();
+          const verify = (await step(`findmnt --real -n ${args.mountpoint}`))
+            .stdout.trim();
 
           return {
             method: "format_mount",
@@ -1149,8 +1190,14 @@ export const model = {
             context.logger,
             (s) => collectStorage((c) => s.run(c), bp),
           );
-          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs, bp);
-          const targetMount = facts.mounts.find((m) => m.target === args.targetMount);
+          const plan = planRelocateSubvol(
+            { ...facts, gatheredAt: "" },
+            relArgs,
+            bp,
+          );
+          const targetMount = facts.mounts.find((m) =>
+            m.target === args.targetMount
+          );
           const record = {
             method: "relocate_subvol",
             dryRun: true as const,
@@ -1195,13 +1242,17 @@ export const model = {
         }
         assertSafe(args.sourceSubvol, SAFE_PATH_RE, "sourceSubvol");
         assertSafe(args.targetMount, SAFE_PATH_RE, "targetMount");
-        if (args.snapshotName) assertSafe(args.snapshotName, SAFE_LABEL_RE, "snapshotName");
+        if (args.snapshotName) {
+          assertSafe(args.snapshotName, SAFE_LABEL_RE, "snapshotName");
+        }
         if (args.finalMountpoint) {
           assertSafe(args.finalMountpoint, SAFE_PATH_RE, "finalMountpoint");
         }
         const result = await withSession(g, context.logger, async (session) => {
           const facts = await collectStorage((c) => session.run(c), bp);
-          const targetMount = facts.mounts.find((m) => m.target === args.targetMount);
+          const targetMount = facts.mounts.find((m) =>
+            m.target === args.targetMount
+          );
           if (!targetMount || targetMount.fstype !== "btrfs") {
             throw new Error(
               `relocate_subvol refused: ${args.targetMount} is not a mounted btrfs filesystem.`,
@@ -1212,7 +1263,10 @@ export const model = {
           // partition), so identity must be compared against the parent disk;
           // and we compare identity ONLY (the target is required to be mounted,
           // so the mounted-device refusal doesn't apply here).
-          const targetDisk = findDiskFor(facts.blockDevices, targetMount.source);
+          const targetDisk = findDiskFor(
+            facts.blockDevices,
+            targetMount.source,
+          );
           const identityReasons = identityMismatches(
             targetDisk,
             args.confirmDevice!,
@@ -1226,20 +1280,30 @@ export const model = {
             );
           }
 
-          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs, bp);
+          const plan = planRelocateSubvol(
+            { ...facts, gatheredAt: "" },
+            relArgs,
+            bp,
+          );
           const snapPath = plan.snapPath;
           const snapBase = snapPath.slice(snapPath.lastIndexOf("/") + 1);
-          const received = `${args.targetMount.replace(/\/+$/, "")}/${snapBase}`;
+          const received = `${
+            args.targetMount.replace(/\/+$/, "")
+          }/${snapBase}`;
 
           // `step` privilege-escalates every command with `bp` (all need root).
           const step = async (cmd: string) => {
             const r = await session.run(`${bp}${cmd}`);
             if (r.exitCode !== 0) {
-              throw new Error(`\`${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`);
+              throw new Error(
+                `\`${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`,
+              );
             }
             return r;
           };
-          await step(`btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`);
+          await step(
+            `btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
+          );
           // `sync` needs no privilege — run it unprefixed so it matches the plan
           // (the plan lists a bare `sync`), keeping plan ≡ live under `become`.
           await session.run("sync");
@@ -1249,10 +1313,15 @@ export const model = {
           // subshell so the option doesn't leak into later session commands. Run
           // directly (NOT via `step`, which would prefix the subshell as a whole,
           // i.e. `sudo -n ( … )`) — `bp` goes on each pipeline stage instead.
-          const pipe = `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`;
+          const pipe =
+            `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`;
           const sr = await session.run(pipe);
           if (sr.exitCode !== 0) {
-            throw new Error(`\`${pipe}\` failed (rc=${sr.exitCode}): ${sr.stdout.slice(-300)}`);
+            throw new Error(
+              `\`${pipe}\` failed (rc=${sr.exitCode}): ${
+                sr.stdout.slice(-300)
+              }`,
+            );
           }
 
           // Verify (never trust the exit code alone):
@@ -1260,25 +1329,36 @@ export const model = {
           //     own `UUID` (line-anchored so `Parent UUID:` can't false-match),
           //  2. file counts match, and
           //  3. byte totals match.
-          const srcShow = (await step(`btrfs subvolume show ${snapPath}`)).stdout;
-          const dstShow = (await step(`btrfs subvolume show ${received}`)).stdout;
+          const srcShow =
+            (await step(`btrfs subvolume show ${snapPath}`)).stdout;
+          const dstShow =
+            (await step(`btrfs subvolume show ${received}`)).stdout;
           const srcUuid = srcShow.match(/^\s*UUID:\s*([0-9a-f-]+)/im)?.[1];
-          const rcvUuid = dstShow.match(/^\s*Received UUID:\s*([0-9a-f-]+)/im)?.[1];
+          const rcvUuid = dstShow.match(/^\s*Received UUID:\s*([0-9a-f-]+)/im)
+            ?.[1];
           if (!srcUuid || !rcvUuid || srcUuid !== rcvUuid) {
             throw new Error(
-              `relocate verify FAILED: received subvol's Received UUID (${rcvUuid ?? "none"}) ` +
-                `does not match the source snapshot UUID (${srcUuid ?? "none"}).`,
+              `relocate verify FAILED: received subvol's Received UUID (${
+                rcvUuid ?? "none"
+              }) ` +
+                `does not match the source snapshot UUID (${
+                  srcUuid ?? "none"
+                }).`,
             );
           }
-          const srcCount = (await step(`find ${snapPath} -xdev | wc -l`)).stdout.trim();
-          const dstCount = (await step(`find ${received} -xdev | wc -l`)).stdout.trim();
+          const srcCount = (await step(`find ${snapPath} -xdev | wc -l`)).stdout
+            .trim();
+          const dstCount = (await step(`find ${received} -xdev | wc -l`)).stdout
+            .trim();
           if (srcCount !== dstCount) {
             throw new Error(
               `relocate verify FAILED: file count differs (source ${srcCount}, received ${dstCount}).`,
             );
           }
-          const srcBytes = (await step(`du -sb ${snapPath} | cut -f1`)).stdout.trim();
-          const dstBytes = (await step(`du -sb ${received} | cut -f1`)).stdout.trim();
+          const srcBytes = (await step(`du -sb ${snapPath} | cut -f1`)).stdout
+            .trim();
+          const dstBytes = (await step(`du -sb ${received} | cut -f1`)).stdout
+            .trim();
           if (srcBytes !== dstBytes) {
             throw new Error(
               `relocate verify FAILED: byte total differs (source ${srcBytes}, received ${dstBytes}).`,
@@ -1298,7 +1378,8 @@ export const model = {
             const mp = args.finalMountpoint ?? args.sourceSubvol;
             const src0 = targetMount.source.replace(/\[.*$/, "");
             const fsUuid =
-              (await step(`blkid -c /dev/null -s UUID -o value ${src0}`)).stdout.trim();
+              (await step(`blkid -c /dev/null -s UUID -o value ${src0}`)).stdout
+                .trim();
             fstabLine = buildFstabLine({
               uuid: fsUuid,
               mountpoint: mp,
@@ -1310,7 +1391,9 @@ export const model = {
 
           return {
             method: "relocate_subvol",
-            mountpoint: args.repoint ? (args.finalMountpoint ?? args.sourceSubvol) : null,
+            mountpoint: args.repoint
+              ? (args.finalMountpoint ?? args.sourceSubvol)
+              : null,
             source: received,
             uuid: rcvUuid,
             fstype: "btrfs",
