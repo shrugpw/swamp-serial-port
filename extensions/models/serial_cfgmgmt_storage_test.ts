@@ -266,6 +266,26 @@ Deno.test("parseBtrfs attributes subvols to the right fs by device (multi-fs boa
   assertEquals(nvme.subvolumes.map((s) => s.path), ["var"]);
 });
 
+Deno.test("parseBtrfs caps devid lines by `Total devices N` (stray residue ignored)", () => {
+  // A stray `devid` line (late printk / console noise) after the declared count
+  // must NOT be cross-attributed to the fs — else a wrong device leaks into
+  // fs.devices and pulls another fs's subvolumes in via the device match.
+  const show =
+    "Label: 'a'  uuid: aaaa\n\tTotal devices 1 FS bytes used 10\n" +
+    "\tdevid    1 size 100 used 10 path /dev/sda1\n" +
+    "\tdevid    2 size 999 used 99 path /dev/sdb1\n" + // stray — exceeds Total devices 1
+    "Label: 'b'  uuid: bbbb\n\tTotal devices 1 FS bytes used 20\n" +
+    "\tdevid    1 size 200 used 20 path /dev/nvme0n1p1\n";
+  const fss = parseBtrfs(show, [
+    { mount: "/", device: "/dev/sda1", stdout: "ID 256 gen 5 top level 5 path root\n" },
+    { mount: "/data", device: "/dev/nvme0n1p1", stdout: "ID 257 gen 5 top level 5 path data\n" },
+  ]);
+  assertEquals(fss.find((f) => f.label === "a")!.devices, ["/dev/sda1"]); // stray sdb1 dropped
+  assertEquals(fss.find((f) => f.label === "b")!.devices, ["/dev/nvme0n1p1"]);
+  // ...so subvols don't cross-attribute:
+  assertEquals(fss.find((f) => f.label === "b")!.subvolumes.map((s) => s.path), ["data"]);
+});
+
 // ————————————————————————————————————————————————————————————————
 // Collector
 // ————————————————————————————————————————————————————————————————

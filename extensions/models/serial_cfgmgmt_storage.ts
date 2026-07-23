@@ -331,6 +331,10 @@ export function parseBtrfs(
 ): BtrfsFs[] {
   const fss: BtrfsFs[] = [];
   let cur: BtrfsFs | null = null;
+  // Each `Label:` block declares `Total devices N`; only accept N `devid` lines
+  // for that fs so a stray trailing `devid` line (late printk / console residue
+  // after the real payload) can't be cross-attributed to the wrong filesystem.
+  let deviceCap = Infinity;
   for (const line of showRaw.split("\n")) {
     const label = line.match(/^Label:\s+(?:'([^']*)'|none)\s+uuid:\s+(\S+)/i);
     if (label) {
@@ -341,10 +345,16 @@ export function parseBtrfs(
         subvolumes: [],
       };
       fss.push(cur);
+      deviceCap = Infinity;
+      continue;
+    }
+    const total = line.match(/\bTotal devices\s+(\d+)/i);
+    if (total && cur) {
+      deviceCap = Number(total[1]);
       continue;
     }
     const dev = line.match(/^\s*devid\s+\d+.*\bpath\s+(\S+)/);
-    if (dev && cur) cur.devices.push(dev[1]);
+    if (dev && cur && cur.devices.length < deviceCap) cur.devices.push(dev[1]);
   }
   // Attribute each subvol list to its filesystem by matching the mount's backing
   // device to the fs's member devices. Dedup by id within a fs (the same subvol
@@ -1230,7 +1240,9 @@ export const model = {
             return r;
           };
           await step(`btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`);
-          await step("sync");
+          // `sync` needs no privilege — run it unprefixed so it matches the plan
+          // (the plan lists a bare `sync`), keeping plan ≡ live under `become`.
+          await session.run("sync");
           // send|receive is a single local pipeline; it can run long with no
           // intermediate output — the session's maxMs bound applies. pipefail so
           // a failing `send` isn't masked by a succeeding `receive`; in a
