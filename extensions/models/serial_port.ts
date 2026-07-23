@@ -62,15 +62,17 @@ import {
   captureBytes as captureBytesOf,
   type CaptureThresholds,
   computeReadPlan,
+  fileSize,
   loadThresholds,
-  planRotation,
   prevCapturePath,
   readCaptureRange,
+  redactSecretInRing,
   removeRing,
   retainedStart as retainedStartOf,
   ringReadPort,
   rotateRing,
   sessionCapturePath,
+  shouldRotate,
   startDrainer,
   stopDrainer,
   toBase64,
@@ -215,7 +217,7 @@ const SessionResourceSchema = z.object({
     "PID of the detached drainer that owns the PTY slave.",
   ),
   captureMaxBytes: z.number().optional().describe(
-    "Rotate the ring when the total stream length crosses this.",
+    "Rotate when the current ring file crosses this (window is up to ~2x).",
   ),
   captureBase: z.number().optional().describe(
     "Stream offset where the current ring file begins (Σ rotated sizes).",
@@ -1204,7 +1206,12 @@ function transportFor(context: MethodContext): Transport {
 async function maybeRotate(
   session: SessionResource,
 ): Promise<
-  { captureBase: number; prevSize: number; drainerPid: number } | null
+  {
+    captureBase: number;
+    prevSize: number;
+    drainerPid: number | null;
+    drainerAlive: boolean;
+  } | null
 > {
   const ringPath = session.capturePath;
   if (!ringPath) return null;
@@ -1214,17 +1221,19 @@ async function maybeRotate(
     session.prevSize ?? 0,
   );
   const max = session.captureMaxBytes ?? DEFAULT_CAPTURE_MAX_BYTES;
-  const plan = planRotation(t, max);
-  if (!plan.rotate) return null;
-  const drainerPid = await rotateRing(
+  // Gate on the CURRENT file size, not the monotonic total stream length.
+  if (!shouldRotate(t, max)) return null;
+  const r = await rotateRing(
     session.ptyLink,
     ringPath,
     session.drainerPid ?? null,
+    t.captureBase,
   );
   return {
-    captureBase: plan.newCaptureBase,
-    prevSize: plan.newPrevSize,
-    drainerPid,
+    captureBase: r.newCaptureBase,
+    prevSize: r.newPrevSize,
+    drainerPid: r.drainerPid,
+    drainerAlive: r.drainerAlive,
   };
 }
 
@@ -1541,6 +1550,11 @@ export const model = {
           );
         }
         const password = g.password;
+        // Under capture, the drainer records every raw PTY byte with no scrub of
+        // its own; if the far-end console echoes the Password: entry, the vaulted
+        // secret would persist plaintext in the ring. Note the ring end BEFORE
+        // login so we can redact the login span afterwards (CAP-2).
+        const redactFrom = capturing && ringPath ? await fileSize(ringPath) : 0;
         const result = await withPort(
           transportFor(context),
           ioCfg,
@@ -1559,6 +1573,18 @@ export const model = {
             });
           },
         );
+        // Offset-preserving in-place redaction of the credential from the ring
+        // (serialised on the model lock — no concurrent reader). Belt-and-braces
+        // with the getty's echo-off; the transcript is already scrubbed.
+        if (capturing && ringPath) {
+          const n = await redactSecretInRing(ringPath, redactFrom, password);
+          if (n > 0) {
+            context.logger.info(
+              "Redacted {n} credential occurrence(s) from the capture ring on {device}",
+              { n, device: cfg.device },
+            );
+          }
+        }
         context.logger.info("login on {device} as {user}: {status}", {
           device: cfg.device,
           user: username,
@@ -1588,7 +1614,7 @@ export const model = {
         captureMaxBytes: z.number().int().positive().default(
           DEFAULT_CAPTURE_MAX_BYTES,
         ).describe(
-          "Rotate the ring when the total stream length crosses this (append + rotate-on-restart; a two-file .1+current window is retained).",
+          "Rotate when the CURRENT ring file crosses this many bytes (append + rotate-on-restart; the retained .1+current window is up to ~2x this).",
         ),
         ...OverrideArgs,
       }),
@@ -1612,7 +1638,12 @@ export const model = {
         );
         // Capture bookkeeping: a fresh stream starts at 0. Clear any prior ring
         // (+ .1) so a stale cursor from a previous stream cannot mis-seek this
-        // one; the resource omits `cursor` when capture is off.
+        // one; the resource omits `cursor` when capture is off. removeRing runs
+        // only AFTER startHolder has succeeded — i.e. once we own the device — so
+        // a sibling instance still capturing this device (which would hold it and
+        // fail our startHolder with EBUSY) never has its ring destroyed by us.
+        // (Cross-instance same-device coordination beyond that is the same
+        // documented limitation as the §2b holder — instances are not keyed.)
         let capture: Record<string, unknown> = {};
         if (args.capture) {
           const capturePath = sessionCapturePath(cfg.device);
@@ -1823,7 +1854,18 @@ export const model = {
         const rot = await maybeRotate(session);
         const captureBase = rot?.captureBase ?? (session.captureBase ?? 0);
         const prevSize = rot?.prevSize ?? (session.prevSize ?? 0);
-        const drainerPid = rot?.drainerPid ?? session.drainerPid;
+        // After a rotation, adopt its (possibly null) new drainer pid; without
+        // one, keep the existing pid. A rotation whose drainer restart failed
+        // means capture is dead — record that honestly (thresholds still get
+        // persisted below so disk and record agree; CAP-5).
+        const capturingNow = rot ? rot.drainerAlive : true;
+        const drainerPid = rot ? rot.drainerPid : (session.drainerPid ?? null);
+        if (rot && !rot.drainerAlive) {
+          context.logger.info(
+            "Capture drainer restart FAILED after rotation on {device}; capture stopped — session_stop then session_start capture=true to resume",
+            { device },
+          );
+        }
         const t = await loadThresholds(ringPath, captureBase, prevSize);
         const sinceOffset = args.sinceOffset ?? (session.cursor ?? 0);
         const plan = computeReadPlan(t, sinceOffset, args.maxBytes);
@@ -1873,9 +1915,9 @@ export const model = {
             startedAt: session.startedAt,
             live: true,
             checkedAt: now,
-            capturing: true,
+            capturing: capturingNow,
             capturePath: ringPath,
-            drainerPid,
+            ...(typeof drainerPid === "number" ? { drainerPid } : {}),
             captureMaxBytes: session.captureMaxBytes,
             captureBase: t.captureBase,
             prevSize: t.prevSize,

@@ -15,20 +15,23 @@
  * @module
  */
 import { assertEquals } from "jsr:@std/assert@1";
-import type { SerialPort } from "./serial_port.ts";
+import { drainUntil, execOn, type SerialPort } from "./serial_port.ts";
 import {
   captureBytes,
   type CaptureThresholds,
   computeReadPlan,
   concatBytes,
   fileSize,
-  planRotation,
+  indexOfBytes,
   prevCapturePath,
   readCaptureRange,
   readFileBytes,
+  redactSecretInRing,
   retainedStart,
   ringReadPort,
+  rotationThresholds,
   sessionCapturePath,
+  shouldRotate,
   toBase64,
 } from "./serial_capture.ts";
 
@@ -72,6 +75,15 @@ Deno.test("computeReadPlan: caught up (cursor at EOF) returns nothing, not evict
   const p = computeReadPlan(t, 50, 1024);
   assertEquals(p.fromOffset, 50);
   assertEquals(p.nextOffset, 50);
+  assertEquals(p.evicted, false);
+  assertEquals(p.segments, []);
+});
+
+Deno.test("computeReadPlan: CAP-8 — an out-of-range-high sinceOffset clamps to EOF, not the future", () => {
+  const t: CaptureThresholds = { captureBase: 0, prevSize: 0, currentSize: 50 };
+  const p = computeReadPlan(t, 5000, 1024); // way past the stream end
+  assertEquals(p.fromOffset, 50); // clamped down to captureBytes, NOT 5000
+  assertEquals(p.nextOffset, 50); // cursor pinned to EOF, so no silent stall
   assertEquals(p.evicted, false);
   assertEquals(p.segments, []);
 });
@@ -134,37 +146,50 @@ Deno.test("computeReadPlan: read entirely within .1 (no current segment)", () =>
   assertEquals(p.nextOffset, 85);
 });
 
-// ── planRotation ────────────────────────────────────────────────────────────
+// ── shouldRotate / rotationThresholds ───────────────────────────────────────
 
-Deno.test("planRotation: rotates when the stream crosses the bound", () => {
-  const t: CaptureThresholds = { captureBase: 0, prevSize: 0, currentSize: 500 };
-  const r = planRotation(t, 400);
-  assertEquals(r.rotate, true);
-  assertEquals(r.newCaptureBase, 500); // old current becomes .1
-  assertEquals(r.newPrevSize, 500);
+Deno.test("shouldRotate: fires when the CURRENT file crosses the bound", () => {
+  assertEquals(
+    shouldRotate({ captureBase: 0, prevSize: 0, currentSize: 500 }, 400),
+    true,
+  );
+  assertEquals(
+    shouldRotate({ captureBase: 0, prevSize: 0, currentSize: 400 }, 400),
+    false,
+  );
 });
 
-Deno.test("planRotation: retainedStart after rotation equals the old captureBase", () => {
-  const t: CaptureThresholds = { captureBase: 500, prevSize: 500, currentSize: 500 };
-  const r = planRotation(t, 900); // captureBytes=1000 > 900
-  assertEquals(r.rotate, true);
+Deno.test("shouldRotate: CAP-1 regression — a huge captureBase with a tiny current does NOT rotate", () => {
+  // The bug was gating on captureBytes=captureBase+currentSize (monotonic): once
+  // the stream ever crossed the bound, every read re-rotated and discarded .1.
+  // Gating on currentSize alone must return false here.
+  assertEquals(
+    shouldRotate({ captureBase: 5000, prevSize: 5000, currentSize: 1 }, 4000),
+    false,
+  );
+  assertEquals(
+    shouldRotate({ captureBase: 8_000_000, prevSize: 4_000_000, currentSize: 10 }, 4_194_304),
+    false,
+  );
+});
+
+Deno.test("shouldRotate: never rotates an empty current file", () => {
+  assertEquals(
+    shouldRotate({ captureBase: 400, prevSize: 400, currentSize: 0 }, 100),
+    false,
+  );
+});
+
+Deno.test("rotationThresholds: current becomes .1; retainedStart = old captureBase", () => {
+  const th = rotationThresholds(500, 600); // captureBase=500, final currentSize=600
+  assertEquals(th.newCaptureBase, 1100);
+  assertEquals(th.newPrevSize, 600);
   const after: CaptureThresholds = {
-    captureBase: r.newCaptureBase,
-    prevSize: r.newPrevSize,
+    captureBase: th.newCaptureBase,
+    prevSize: th.newPrevSize,
     currentSize: 0,
   };
-  // The new .1 spans [old captureBase, old captureBytes); its start is old base.
-  assertEquals(retainedStart(after), 500);
-});
-
-Deno.test("planRotation: no rotation under the bound", () => {
-  const t: CaptureThresholds = { captureBase: 0, prevSize: 0, currentSize: 100 };
-  assertEquals(planRotation(t, 400).rotate, false);
-});
-
-Deno.test("planRotation: never rotates an empty current file", () => {
-  const t: CaptureThresholds = { captureBase: 400, prevSize: 400, currentSize: 0 };
-  assertEquals(planRotation(t, 100).rotate, false);
+  assertEquals(retainedStart(after), 500); // the new .1 starts at the old base
 });
 
 // ── toBase64 ────────────────────────────────────────────────────────────────
@@ -314,6 +339,140 @@ Deno.test("ringReadPort reads forward from the ring end and resumes after append
     await Deno.writeFile(ring, more, { append: true });
     const n2 = await port.read(buf);
     assertEquals(buf.subarray(0, n2 as number), more);
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
+// ── Interactive read-forward over a growing ring (design B.4) ───────────────
+
+function fakeClock() {
+  let t = 0;
+  return {
+    now: () => t,
+    sleep: (ms: number) => {
+      t += ms;
+      return Promise.resolve();
+    },
+  };
+}
+
+Deno.test("execOn over ringReadPort: a sentinel landing mid-file matches and stops", async () => {
+  const ring = await Deno.makeTempFile();
+  try {
+    await writeFixture(ring, ramp(80)); // pre-existing bytes the port must skip
+    const writes: Uint8Array[] = [];
+    const port = await ringReadPort(stubPty(writes), ring);
+    // The drainer captures the echoed command + response + RC sentinel + prompt.
+    const resp = new TextEncoder().encode(
+      "uname -r\n6.16.4\n__RC:0:RC__\n[fedora@host ~]$ ",
+    );
+    await Deno.writeFile(ring, resp, { append: true });
+    const r = await execOn(
+      port,
+      {
+        command: "uname -r",
+        lineEnding: "\n",
+        prompt: /__RC:\d+:RC__/,
+        idleMs: 500,
+        maxMs: 5000,
+        stripEcho: false,
+      },
+      fakeClock(),
+    );
+    assertEquals(r.matchedPrompt, true);
+    assertEquals(writes.length, 1); // the command went to the PTY, not the ring
+    assertEquals(r.output.includes("6.16.4"), true);
+    assertEquals(r.output.includes("__RC:0:RC__"), true);
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
+Deno.test("drainUntil over ringReadPort: short reads across 4096 boundaries accumulate to the sentinel", async () => {
+  const ring = await Deno.makeTempFile();
+  try {
+    await writeFixture(ring, new Uint8Array(0));
+    const writes: Uint8Array[] = [];
+    const port = await ringReadPort(stubPty(writes), ring);
+    const big = new Uint8Array(10000).fill(0x2e); // '.', spans 3 read chunks
+    const tail = new TextEncoder().encode("END$ ");
+    await Deno.writeFile(ring, concatBytes([big, tail]), { append: true });
+    const { output, matched } = await drainUntil(
+      port,
+      { idleMs: 500, maxMs: 5000, stopRegex: /END\$ $/ },
+      fakeClock(),
+    );
+    assertEquals(matched, true);
+    assertEquals(output.length, 10005);
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
+Deno.test("computeReadPlan: an offset recorded before a rotation resolves through the captureBase bump", () => {
+  // Cursor 50 recorded when captureBase=0. The file holding [0,100) rotates to
+  // .1 → captureBase=100, prevSize=100. Offset 50 must still resolve into .1.
+  const before: CaptureThresholds = {
+    captureBase: 0,
+    prevSize: 0,
+    currentSize: 100,
+  };
+  assertEquals(computeReadPlan(before, 50, 1024).segments, [
+    { file: "current", start: 50, len: 50 },
+  ]);
+  const after: CaptureThresholds = {
+    captureBase: 100,
+    prevSize: 100,
+    currentSize: 20,
+  };
+  const p = computeReadPlan(after, 50, 1024);
+  assertEquals(p.evicted, false);
+  assertEquals(p.segments, [
+    { file: "prev", start: 50, len: 50 },
+    { file: "current", start: 0, len: 20 },
+  ]);
+});
+
+// ── Secret redaction (CAP-2) ────────────────────────────────────────────────
+
+Deno.test("indexOfBytes finds, misses, and honours the from-offset", () => {
+  const hay = new TextEncoder().encode("abcXYZabcXYZ");
+  const nee = new TextEncoder().encode("XYZ");
+  assertEquals(indexOfBytes(hay, nee), 3);
+  assertEquals(indexOfBytes(hay, nee, 4), 9);
+  assertEquals(indexOfBytes(hay, nee, 10), -1);
+  assertEquals(indexOfBytes(hay, new TextEncoder().encode("nope")), -1);
+  assertEquals(indexOfBytes(hay, new Uint8Array(0)), -1);
+});
+
+Deno.test("redactSecretInRing overwrites the secret in place, preserving offsets", async () => {
+  const ring = await Deno.makeTempFile();
+  try {
+    const pre = new TextEncoder().encode("boot log line\n"); // before login span
+    const login = new TextEncoder().encode(
+      "login: fedora\nPassword: hunter2\n[fedora@host ~]$ ",
+    );
+    await Deno.writeFile(ring, concatBytes([pre, login]));
+    const sizeBefore = await fileSize(ring);
+    const n = await redactSecretInRing(ring, pre.length, "hunter2");
+    assertEquals(n, 1);
+    assertEquals(await fileSize(ring), sizeBefore); // offset-preserving
+    const text = new TextDecoder().decode(await readFileBytes(ring, 0, sizeBefore));
+    assertEquals(text.includes("hunter2"), false); // secret gone
+    assertEquals(text.includes("*******"), true); // equal-length redaction
+    assertEquals(text.startsWith("boot log line\n"), true); // pre-span untouched
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
+Deno.test("redactSecretInRing is a no-op for an absent or empty secret", async () => {
+  const ring = await Deno.makeTempFile();
+  try {
+    await Deno.writeFile(ring, new TextEncoder().encode("no secrets here\n"));
+    assertEquals(await redactSecretInRing(ring, 0, "absent"), 0);
+    assertEquals(await redactSecretInRing(ring, 0, ""), 0);
   } finally {
     await Deno.remove(ring);
   }

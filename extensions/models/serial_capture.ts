@@ -125,7 +125,11 @@ export function computeReadPlan(
   // `evicted` keys on retainedStart, NOT captureBase: the `.1` range
   // [retainedStart, captureBase) is still readable.
   const evicted = sinceOffset < rStart;
-  const lower = Math.max(sinceOffset, rStart);
+  // Clamp the low end into [retainedStart, captureBytes]: a caller-supplied
+  // sinceOffset past the current stream end must not pin the cursor to a future
+  // value (which would silently stall every default read until volume catches
+  // up). An out-of-range-high offset resolves to "caught up at EOF".
+  const lower = Math.min(Math.max(sinceOffset, rStart), cBytes);
   const upper = Math.min(sinceOffset + maxBytes, cBytes);
   const len = Math.max(0, upper - lower);
   const fromOffset = lower;
@@ -156,36 +160,42 @@ export function computeReadPlan(
 }
 
 /** The threshold updates a rotation applies (pure — the file dance is separate). */
-export interface RotationPlan {
-  rotate: boolean;
+export interface RotationThresholds {
   /** New `captureBase` after the current file becomes `.1`. */
   newCaptureBase: number;
-  /** New `prevSize` (the old current file's size). */
+  /** New `prevSize` (the rotated current file's final size). */
   newPrevSize: number;
 }
 
 /**
- * Decide whether the ring should rotate and the thresholds it moves to. Rotation
- * fires when the total stream length crosses `captureMaxBytes`: the current file
- * becomes `.1` (the old `.1` is discarded), so `captureBase` advances by the old
- * current size and `prevSize` becomes that size. `retainedStart` after rotation
- * equals the *old* `captureBase` — the old `.1` range rolls off to evicted.
+ * Whether the ring should rotate: the CURRENT FILE (not the monotonic total
+ * stream length) has crossed `captureMaxBytes`. `captureMaxBytes` bounds one
+ * generation, so the retained window (`.1` + current) is at most ~2×. Gating on
+ * `captureBytes` would be a bug — that value only ever grows, so once the stream
+ * first crosses the bound every subsequent read would rotate again, discarding
+ * the `.1` the ring exists to keep.
  */
-export function planRotation(
+export function shouldRotate(
   t: CaptureThresholds,
   captureMaxBytes: number,
-): RotationPlan {
-  if (captureBytes(t) <= captureMaxBytes || t.currentSize <= 0) {
-    return {
-      rotate: false,
-      newCaptureBase: t.captureBase,
-      newPrevSize: t.prevSize,
-    };
-  }
+): boolean {
+  return t.currentSize > captureMaxBytes;
+}
+
+/**
+ * The thresholds after the current file (final size `currentSize`, sampled
+ * AFTER the drainer is stopped so no in-flight append is stranded) becomes `.1`
+ * and the old `.1` is discarded: `captureBase` advances by that size and
+ * `prevSize` becomes it. `retainedStart` afterwards equals the old `captureBase`
+ * — the old `.1` range rolls off to evicted.
+ */
+export function rotationThresholds(
+  captureBase: number,
+  currentSize: number,
+): RotationThresholds {
   return {
-    rotate: true,
-    newCaptureBase: t.captureBase + t.currentSize,
-    newPrevSize: t.currentSize,
+    newCaptureBase: captureBase + currentSize,
+    newPrevSize: currentSize,
   };
 }
 
@@ -332,12 +342,20 @@ async function pidAlive(pid: number): Promise<boolean> {
  * reopen cannot duplicate bytes at a seam. It never parses and never self-rotates
  * — rotation is a model operation ({@link rotateRing}) so it serialises against
  * `exec`/`read` on the model lock. Returns the drainer pid.
+ *
+ * The ring is force-created `0600` before capture begins: it holds the entire
+ * console history and `captureRuntimeDir()` may fall back to world-traversable
+ * `/tmp` (when `$XDG_RUNTIME_DIR` is unset, e.g. a systemd/cron/container run),
+ * so its confidentiality cannot rest on the directory mode alone.
  */
 export async function startDrainer(
   ptyLink: string,
   ringPath: string,
 ): Promise<number> {
-  const script = `stty -F ${shq(ptyLink)} min 1 time 0 2>/dev/null; ` +
+  const prev = prevCapturePath(ringPath);
+  const script = `umask 077; touch ${shq(ringPath)}; ` +
+    `chmod 600 ${shq(ringPath)} ${shq(prev)} 2>/dev/null; ` +
+    `stty -F ${shq(ptyLink)} min 1 time 0 2>/dev/null; ` +
     `exec cat ${shq(ptyLink)} >> ${shq(ringPath)}`;
   const started = await sh(
     `setsid sh -c ${shq(script)} >/dev/null 2>&1 </dev/null & echo $!`,
@@ -369,30 +387,52 @@ export async function removeRing(ringPath: string): Promise<void> {
   await sh(`rm -f ${shq(ringPath)} ${shq(prevCapturePath(ringPath))}`);
 }
 
+/** The outcome of a rotation: the new thresholds + whether capture is still up. */
+export interface RotationResult extends RotationThresholds {
+  /** New drainer pid, or null when the restart failed. */
+  drainerPid: number | null;
+  /** True when a fresh drainer is confirmed running post-rotation. */
+  drainerAlive: boolean;
+}
+
 /**
- * Perform the file dance of a rotation: stop the old drainer, discard the old
- * `.1`, `mv current → .1`, recreate an empty current, and start a fresh drainer.
- * Returns the new drainer pid. The threshold updates are computed separately by
- * {@link planRotation} and written to the `session` resource by the caller, which
- * holds the model lock — so no `exec`/`read` overlaps this teardown.
+ * Perform a rotation: stop the old drainer, sample the current file's FINAL size
+ * (only now that the drainer can no longer append — so bytes drained in the
+ * decision→kill window are not stranded, and the offset math matches disk),
+ * discard the old `.1`, `mv current → .1`, recreate an empty current, and start
+ * a fresh drainer. Returns the post-rotation thresholds and whether the restart
+ * succeeded. The caller (holding the model lock, so no `exec`/`read` overlaps)
+ * persists these thresholds to the `session` resource REGARDLESS of restart
+ * success — otherwise a failed restart would leave the record's offsets
+ * disagreeing with the on-disk files and mis-seek the next read.
  *
- * A brief gap (the drainer/socat down for the `mv`+restart, a few ms) drops bytes
- * the board emits into the closed tty; accepted for v1 (true zero-gap needs an
+ * A brief gap (the drainer down for the `mv`+restart, a few ms) drops bytes the
+ * board emits into the closed tty; accepted for v1 (true zero-gap needs an
  * in-place wrap or an fd handoff — B.5).
  */
 export async function rotateRing(
   ptyLink: string,
   ringPath: string,
   oldDrainerPid: number | null,
-): Promise<number> {
+  captureBase: number,
+): Promise<RotationResult> {
   const prev = prevCapturePath(ringPath);
   await stopDrainer(oldDrainerPid);
+  const finalSize = await fileSize(ringPath); // stable: drainer is stopped
+  const th = rotationThresholds(captureBase, finalSize);
   await sh(
     `rm -f ${shq(prev)}; mv -f ${shq(ringPath)} ${shq(prev)}; : > ${
       shq(ringPath)
     }`,
   );
-  return await startDrainer(ptyLink, ringPath);
+  try {
+    const drainerPid = await startDrainer(ptyLink, ringPath);
+    return { ...th, drainerPid, drainerAlive: true };
+  } catch {
+    // The irreversible file dance is done; report the dead drainer so the
+    // caller records capturing=false + the new thresholds (disk == record).
+    return { ...th, drainerPid: null, drainerAlive: false };
+  }
 }
 
 /**
@@ -404,6 +444,12 @@ export async function rotateRing(
  * `execOn`/`drainUntil`/`loginOn` run unchanged over this port. No rotation can
  * fire mid-call (rotation is a model op on the same lock), so the current file is
  * stable and a plain forward file cursor suffices.
+ *
+ * Each read is stat-gated: `drainUntil` polls every ~20 ms, so spawning a `dd`
+ * on every idle poll would be a subprocess storm. A cheap `stat` short-circuits
+ * to 0 bytes when the ring has not grown, and `dd` runs only when there is new
+ * data (bounded to `buf.length`). (A persistent tail reader would cut even the
+ * stat spawns — a follow-up; the subprocess discipline of #1350 is kept here.)
  */
 export async function ringReadPort(
   pty: SerialPort,
@@ -415,7 +461,10 @@ export async function ringReadPort(
   return {
     write: (bytes: Uint8Array) => pty.write(bytes),
     read: async (buf: Uint8Array): Promise<number | null> => {
-      const bytes = await readFileBytes(ringPath, pos, buf.length);
+      const size = await fileSize(ringPath);
+      if (size <= pos) return 0; // nothing new — no dd spawn while idle
+      const want = Math.min(buf.length, size - pos);
+      const bytes = await readFileBytes(ringPath, pos, want);
       if (bytes.length === 0) return 0;
       buf.set(bytes.subarray(0, buf.length));
       pos += bytes.length;
@@ -423,4 +472,87 @@ export async function ringReadPort(
     },
     close: () => pty.close(),
   };
+}
+
+// ── Secret redaction in the ring (CAP-2) ─────────────────────────────────────
+
+/** First index of `needle` in `hay` at or after `from`, or -1. */
+export function indexOfBytes(
+  hay: Uint8Array,
+  needle: Uint8Array,
+  from = 0,
+): number {
+  if (needle.length === 0 || needle.length > hay.length) return -1;
+  outer:
+  for (let i = Math.max(0, from); i <= hay.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (hay[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/** Overwrite `bytes` at byte `offset` in `path` in place (no truncation). */
+async function writeFileBytesAt(
+  path: string,
+  offset: number,
+  bytes: Uint8Array,
+): Promise<boolean> {
+  if (bytes.length === 0) return true;
+  try {
+    const child = new Deno.Command("dd", {
+      args: [
+        `of=${path}`,
+        `bs=${bytes.length}`,
+        `seek=${offset}`,
+        "count=1",
+        "conv=notrunc",
+        "oflag=seek_bytes",
+      ],
+      stdin: "piped",
+      stdout: "null",
+      stderr: "null",
+      signal: AbortSignal.timeout(SUBPROC_IO_TIMEOUT_MS),
+    }).spawn();
+    const w = child.stdin.getWriter();
+    await w.write(bytes);
+    await w.close();
+    return (await child.status).success;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Redact every occurrence of `secret` in the ring's tail `[fromOffset, EOF)`,
+ * overwriting each with an EQUAL-length run of `*` (offset-preserving, so the
+ * capture stream offsets are unchanged) via an in-place `dd conv=notrunc`. The
+ * drainer records raw PTY bytes with no scrub of its own, so a `login` whose
+ * far-end console echoes the password would otherwise persist it in plaintext;
+ * this is called after such a login (which serialises on the model lock, so no
+ * concurrent reader), bounded to the login span. Post-login appends past EOF are
+ * untouched. Same substring-match limitation as the transcript `scrubSecret`.
+ * Returns the number of occurrences redacted.
+ */
+export async function redactSecretInRing(
+  ringPath: string,
+  fromOffset: number,
+  secret: string,
+): Promise<number> {
+  if (!secret) return 0;
+  const sec = new TextEncoder().encode(secret);
+  if (sec.length === 0) return 0;
+  const size = await fileSize(ringPath);
+  if (size <= fromOffset) return 0;
+  const tail = await readFileBytes(ringPath, fromOffset, size - fromOffset);
+  let count = 0;
+  let idx = indexOfBytes(tail, sec, 0);
+  while (idx >= 0) {
+    tail.fill(0x2a, idx, idx + sec.length); // '*'
+    count++;
+    idx = indexOfBytes(tail, sec, idx + sec.length);
+  }
+  if (count > 0) await writeFileBytesAt(ringPath, fromOffset, tail);
+  return count;
 }
