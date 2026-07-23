@@ -26,6 +26,8 @@ import {
   selectTransport,
   sendLine,
   type SerialPort,
+  sessionPtyPath,
+  socatDeviceOpts,
   stripEchoedCommand,
 } from "./serial_port.ts";
 
@@ -226,6 +228,47 @@ Deno.test("selectTransport — each mode yields a configure+open transport", () 
   const a = makeDirectTransport();
   const b = makeSubprocessTransport();
   assertEquals(a.open === b.open, false);
+});
+
+// ── session holder ──────────────────────────────────────────────────────────
+
+Deno.test("socatDeviceOpts — maps framing to socat serial options", () => {
+  const opts = (framing: string, baud = 115200) =>
+    socatDeviceOpts({ device: "/dev/ttyUSB0", baud, framing, lineEnding: "\n" });
+  // 8N1: 8 bits, no parity, 1 stop bit; raw, no echo, no flow control, no hangup.
+  assertEquals(
+    opts("8N1"),
+    "raw,echo=0,b115200,cs8,parenb=0,cstopb=0,clocal=1,crtscts=0,hupcl=0",
+  );
+  // 7E2: even parity (parenb + parodd=0), 2 stop bits.
+  assertEquals(
+    opts("7E2", 9600),
+    "raw,echo=0,b9600,cs7,parenb=1,parodd=0,cstopb=1,clocal=1,crtscts=0,hupcl=0",
+  );
+  // Odd parity sets parodd=1.
+  assertMatch(opts("8O1"), /parenb=1,parodd=1/);
+});
+
+Deno.test("socatDeviceOpts — rejects malformed framing", () => {
+  assertThrows(
+    () =>
+      socatDeviceOpts({
+        device: "/dev/ttyUSB0",
+        baud: 115200,
+        framing: "9N1",
+        lineEnding: "\n",
+      }),
+    Error,
+    "Invalid framing",
+  );
+});
+
+Deno.test("sessionPtyPath — derives a stable, sanitised PTY link path", () => {
+  assertEquals(sessionPtyPath("/dev/ttyUSB0"), "/tmp/swamp-serial-_dev_ttyUSB0.pty");
+  // Same device → same path (so separate runs find the same holder).
+  assertEquals(sessionPtyPath("/dev/ttyUSB0"), sessionPtyPath("/dev/ttyUSB0"));
+  // No shell metacharacters survive sanitisation.
+  assertMatch(sessionPtyPath("/dev/serial/by-id/usb-x.y"), /^\/tmp\/swamp-serial-[\w-]+\.pty$/);
 });
 
 Deno.test("isPermissionError — detects Deno permission denials", () => {

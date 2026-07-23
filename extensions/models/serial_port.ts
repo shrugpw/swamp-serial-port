@@ -13,6 +13,9 @@
  *   returns or the line goes idle. The console-shell primitive.
  * - `login`     — answer a getty login (login: / Password:) from a vaulted
  *   credential, then confirm the shell prompt.
+ * - `session_start` / `session_stop` / `session_status` — run a persistent
+ *   `socat` holder that keeps the port (and its login) open across separate
+ *   method runs; the I/O methods above auto-attach to it when it is live.
  *
  * ## Design
  *
@@ -46,8 +49,11 @@
  * to write the vaulted password to an arbitrary terminal. Stop-pattern matching
  * runs against a bounded suffix of the captured output, and `idleMs`/`maxMs`
  * carry ceilings — bounding both memory and regex work. Cross-instance
- * exclusivity is a documented limitation (external holders are detected via
- * EBUSY; this model does not itself claim a TIOCEXCL lock).
+ * exclusivity is a documented limitation for one-shot methods (external holders
+ * are detected via EBUSY; this model does not claim a TIOCEXCL lock) — but while
+ * a `session_start` holder runs it owns the device, so a rival open sees EBUSY
+ * for real. Attach only ever redirects to a PTY recorded in our own `session`
+ * resource, so the vaulted password still cannot be steered to an arbitrary path.
  *
  * @module
  */
@@ -168,6 +174,22 @@ const LoginResourceSchema = z.object({
   status: z.enum(["ok", "failed"]),
   transcript: z.string(),
 });
+
+const SessionResourceSchema = z.object({
+  device: z.string(),
+  ptyLink: z.string().describe(
+    "The PTY the holder exposes; I/O methods attach here instead of `device`.",
+  ),
+  holderPid: z.number().int(),
+  baud: z.number(),
+  framing: z.string(),
+  lineEnding: z.string(),
+  startedAt: z.iso.datetime(),
+  live: z.boolean().describe("Liveness at the time this record was written."),
+  checkedAt: z.iso.datetime(),
+  stoppedAt: z.iso.datetime().optional(),
+});
+type SessionResource = z.infer<typeof SessionResourceSchema>;
 
 // ── Device allow-list ───────────────────────────────────────────────────────
 
@@ -598,6 +620,117 @@ export async function withPort<T>(
   }
 }
 
+// ── Session holder (socat + PTY) ────────────────────────────────────────────
+//
+// A persistent session keeps the port open across *separate* method runs so the
+// logged-in shell survives (logout→login→gather as distinct runs, or a workflow
+// chaining serial steps). `socat` opens the real device ONCE and bridges it to a
+// PTY; each I/O method attaches to that PTY instead of the device, opening and
+// closing only the PTY between calls while the real port — and the login on it —
+// stays up. Validated on hardware: a `cd` in one run is still in effect in the
+// next. This upgrades the "cross-instance exclusivity is a documented
+// limitation" note: while a holder runs it owns the device, so a rival open sees
+// EBUSY for real. All OS pokes here go through subprocesses (like the transport),
+// so nothing depends on an in-process fs/device permission the runtime may deny.
+
+/** Deterministic PTY link + holder log paths for a device (sanitised). */
+export function sessionPtyPath(device: string): string {
+  return `/tmp/swamp-serial-${device.replace(/\W+/g, "_")}.pty`;
+}
+function holderLogPath(device: string): string {
+  return `/tmp/swamp-serial-${device.replace(/\W+/g, "_")}.log`;
+}
+
+/** Translate line config into socat serial address options (mirrors stty). */
+export function socatDeviceOpts(cfg: PortConfig): string {
+  const m = /^([5-8])([NEO])([12])$/.exec(cfg.framing);
+  if (!m) throw new Error(`Invalid framing "${cfg.framing}" (expected e.g. 8N1)`);
+  const [, bits, parity, stop] = m;
+  const opts = ["raw", "echo=0", `b${cfg.baud}`, `cs${bits}`];
+  if (parity === "N") opts.push("parenb=0");
+  else opts.push("parenb=1", parity === "O" ? "parodd=1" : "parodd=0");
+  opts.push(`cstopb=${stop === "2" ? 1 : 0}`, "clocal=1", "crtscts=0", "hupcl=0");
+  return opts.join(",");
+}
+
+/** Run a short shell snippet; returns {ok, stdout}. Never throws on non-zero. */
+async function sh(
+  script: string,
+  timeoutMs = SUBPROC_IO_TIMEOUT_MS,
+): Promise<{ ok: boolean; stdout: string }> {
+  try {
+    const out = await new Deno.Command("sh", {
+      args: ["-c", script],
+      stdout: "piped",
+      stderr: "null",
+      signal: AbortSignal.timeout(timeoutMs),
+    }).output();
+    return { ok: out.success, stdout: new TextDecoder().decode(out.stdout) };
+  } catch {
+    return { ok: false, stdout: "" };
+  }
+}
+
+/** True when `pid` is a live process this user may signal. */
+async function pidAlive(pid: number): Promise<boolean> {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  return (await sh(`kill -0 ${pid} 2>/dev/null`)).ok;
+}
+
+/** True when the PTY link the holder created still exists. */
+async function linkExists(path: string): Promise<boolean> {
+  return (await sh(`test -e ${path}`)).ok;
+}
+
+/**
+ * A recorded session is live iff its PTY link still exists AND its holder pid is
+ * still running. The link path is derived from the device (ours alone), so an
+ * existing link + a live pid uniquely identifies our holder for MVP purposes.
+ */
+async function isSessionLive(s: SessionResource): Promise<boolean> {
+  return (await linkExists(s.ptyLink)) && (await pidAlive(s.holderPid));
+}
+
+/**
+ * Spawn a detached `socat` that owns `cfg.device` and exposes it as `ptyLink`.
+ * `setsid` puts it in a new session (no SIGHUP when the spawning run exits) and
+ * its stdio is redirected to a log file, so this returns as soon as the shell
+ * backgrounds it. Returns the holder pid once the PTY link appears.
+ */
+async function startHolder(cfg: PortConfig, ptyLink: string): Promise<number> {
+  await stopHolder(null, ptyLink); // clear any stale link first
+  const devAddr = `${cfg.device},${socatDeviceOpts(cfg)}`;
+  const ptyAddr = `PTY,link=${ptyLink},raw,echo=0`;
+  const log = holderLogPath(cfg.device);
+  const started = await sh(
+    `setsid socat ${devAddr} ${ptyAddr} >${log} 2>&1 </dev/null & echo $!`,
+  );
+  const pid = parseInt(started.stdout.trim(), 10);
+  if (!started.ok || !Number.isInteger(pid)) {
+    throw new Error(
+      `Failed to launch socat holder for ${cfg.device} (is socat installed?).`,
+    );
+  }
+  // Wait for socat to create the PTY link and confirm it is running.
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (await linkExists(ptyLink) && await pidAlive(pid)) return pid;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const tail = (await sh(`tail -n 3 ${log} 2>/dev/null`)).stdout.trim();
+  await stopHolder(pid, ptyLink);
+  throw new Error(
+    `socat holder for ${cfg.device} did not come up within 3s` +
+      (tail ? `: ${tail}` : " (is the port free?)."),
+  );
+}
+
+/** SIGTERM the holder (if alive) and remove its PTY link. Best-effort. */
+async function stopHolder(pid: number | null, ptyLink: string): Promise<void> {
+  if (pid !== null && await pidAlive(pid)) await sh(`kill ${pid} 2>/dev/null`);
+  await sh(`rm -f ${ptyLink}`);
+}
+
 // ── Protocol logic (hardware-agnostic, unit-tested) ─────────────────────────
 
 const encoder = new TextEncoder();
@@ -821,11 +954,12 @@ interface MethodContext {
 type Handles = { dataHandles: Array<{ name: string }> };
 
 /**
- * Resolve the effective config for an I/O method: validate the device, then
- * inherit baud/framing/lineEnding from the establish-recorded `port` resource
- * where the call did not override them.
+ * Resolve line config for a method: validate the device, then inherit
+ * baud/framing/lineEnding from the establish-recorded `port` resource where the
+ * call did not override them. Does NOT consider session attach — session
+ * lifecycle methods (`session_*`) act on the real device, so they use this.
  */
-async function resolveConfig(
+async function resolveLineConfig(
   context: MethodContext,
   args: Overrides,
 ): Promise<PortConfig> {
@@ -836,6 +970,56 @@ async function resolveConfig(
   return mergeConfig(context.globalArgs, record as PortResource | null, {
     ...args,
     device,
+  });
+}
+
+/** Read the recorded session for a device, or null. */
+async function readSession(
+  context: MethodContext,
+  device: string,
+): Promise<SessionResource | null> {
+  const rec = await context.readResource?.(instanceKey("session", device)) ??
+    null;
+  return rec as SessionResource | null;
+}
+
+/**
+ * Resolve the effective config for an I/O method. `cfg` always names the REAL
+ * device — resource keys, logs, and stored content use it, so records don't
+ * scatter under an ephemeral PTY path. `ioCfg` is what the transport opens: the
+ * holder's PTY when a live session owns the device, else the real device. The
+ * PTY path comes from our own session record (not user input) and is bound to an
+ * already-allow-listed device, so it needs no separate allow-list.
+ *
+ * `attached` is true when redirected to a holder — the caller then drains any
+ * bytes the PTY buffered while unattached before sending, so a command's
+ * response is not preceded by a previous call's stale output.
+ */
+async function resolveConfig(
+  context: MethodContext,
+  args: Overrides,
+): Promise<{ cfg: PortConfig; ioCfg: PortConfig; attached: boolean }> {
+  const cfg = await resolveLineConfig(context, args);
+  const session = await readSession(context, cfg.device);
+  if (session && await isSessionLive(session)) {
+    context.logger.info("Attaching to held session on {device} via {pty}", {
+      device: cfg.device,
+      pty: session.ptyLink,
+    });
+    return { cfg, ioCfg: { ...cfg, device: session.ptyLink }, attached: true };
+  }
+  return { cfg, ioCfg: cfg, attached: false };
+}
+
+/** Attach drain bounds: clear stale PTY bytes before an attached command. */
+const SESSION_DRAIN_IDLE_MS = 200;
+const SESSION_DRAIN_MAX_MS = 1500;
+
+/** Discard bytes the holder's PTY buffered while unattached (no-op if quiet). */
+async function drainStaleOnAttach(port: SerialPort): Promise<void> {
+  await drainUntil(port, {
+    idleMs: SESSION_DRAIN_IDLE_MS,
+    maxMs: SESSION_DRAIN_MAX_MS,
   });
 }
 
@@ -879,6 +1063,13 @@ export const model = {
     loginResult: {
       description: "Result of a login() attempt (password scrubbed).",
       schema: LoginResourceSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    session: {
+      description:
+        "A persistent socat session holder for the port (pid + PTY link).",
+      schema: SessionResourceSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
@@ -951,10 +1142,10 @@ export const model = {
         },
         context: MethodContext,
       ): Promise<Handles> => {
-        const cfg = await resolveConfig(context, args);
+        const { cfg, ioCfg } = await resolveConfig(context, args);
         const bytesWritten = await withPort(
           transportFor(context),
-          cfg,
+          ioCfg,
           (port) =>
             sendLine(port, args.text, {
               lineEnding: cfg.lineEnding,
@@ -991,10 +1182,12 @@ export const model = {
         args: Overrides & { idleMs: number; maxMs: number },
         context: MethodContext,
       ): Promise<Handles> => {
-        const cfg = await resolveConfig(context, args);
+        // `read` wants whatever the port (or held PTY) has buffered, so it
+        // deliberately does NOT drain on attach.
+        const { cfg, ioCfg } = await resolveConfig(context, args);
         const { output } = await withPort(
           transportFor(context),
-          cfg,
+          ioCfg,
           (port) =>
             drainUntil(port, { idleMs: args.idleMs, maxMs: args.maxMs }),
         );
@@ -1041,19 +1234,21 @@ export const model = {
         },
         context: MethodContext,
       ): Promise<Handles> => {
-        const cfg = await resolveConfig(context, args);
+        const { cfg, ioCfg, attached } = await resolveConfig(context, args);
         const result = await withPort(
           transportFor(context),
-          cfg,
-          (port) =>
-            execOn(port, {
+          ioCfg,
+          async (port) => {
+            if (attached) await drainStaleOnAttach(port);
+            return execOn(port, {
               command: args.command,
               lineEnding: cfg.lineEnding,
               prompt: toRegex(args.prompt),
               idleMs: args.idleMs,
               maxMs: args.maxMs,
               stripEcho: args.stripEcho,
-            }),
+            });
+          },
         );
         context.logger.info(
           "exec on {device}: {cmd} ({n} bytes, prompt matched: {matched})",
@@ -1102,7 +1297,7 @@ export const model = {
         context: MethodContext,
       ): Promise<Handles> => {
         const g = context.globalArgs;
-        const cfg = await resolveConfig(context, args);
+        const { cfg, ioCfg, attached } = await resolveConfig(context, args);
         const username = args.username ?? g.username;
         if (!username) {
           throw new Error(
@@ -1117,16 +1312,18 @@ export const model = {
         const password = g.password;
         const result = await withPort(
           transportFor(context),
-          cfg,
-          (port) =>
-            loginOn(port, {
+          ioCfg,
+          async (port) => {
+            if (attached) await drainStaleOnAttach(port);
+            return loginOn(port, {
               username,
               password,
               lineEnding: cfg.lineEnding,
               promptAfter: toRegex(args.promptAfter),
               idleMs: args.idleMs,
               maxMs: args.maxMs,
-            }),
+            });
+          },
         );
         context.logger.info("login on {device} as {user}: {status}", {
           device: cfg.device,
@@ -1142,6 +1339,130 @@ export const model = {
             attemptedAt: new Date().toISOString(),
             status: result.status,
             transcript: result.transcript,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    session_start: {
+      description:
+        "Start a persistent session holder: a detached `socat` opens the port once and bridges it to a PTY, so the logged-in shell survives across separate method runs. Later send/read/exec/login (and serial-cfgmgmt) calls automatically attach to the holder. Idempotency: errors if one is already live — stop it first with session_stop.",
+      arguments: z.object({ ...OverrideArgs }),
+      execute: async (
+        args: Overrides,
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const cfg = await resolveLineConfig(context, args);
+        const existing = await readSession(context, cfg.device);
+        if (existing && await isSessionLive(existing)) {
+          throw new Error(
+            `A session holder is already running on ${cfg.device} (pid ${existing.holderPid}). Stop it with session_stop first.`,
+          );
+        }
+        const ptyLink = sessionPtyPath(cfg.device);
+        const holderPid = await startHolder(cfg, ptyLink);
+        const now = new Date().toISOString();
+        context.logger.info(
+          "Session holder up on {device} (pid {pid}) → {pty}",
+          { device: cfg.device, pid: holderPid, pty: ptyLink },
+        );
+        const handle = await context.writeResource(
+          "session",
+          instanceKey("session", cfg.device),
+          {
+            device: cfg.device,
+            ptyLink,
+            holderPid,
+            baud: cfg.baud,
+            framing: cfg.framing,
+            lineEnding: cfg.lineEnding,
+            startedAt: now,
+            live: true,
+            checkedAt: now,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    session_stop: {
+      description:
+        "Stop the persistent session holder on the port (SIGTERM the socat holder, remove the PTY link). Safe to call when none is running.",
+      arguments: z.object({ ...OverrideArgs }),
+      execute: async (
+        args: Overrides,
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const device = args.device ?? context.globalArgs.device;
+        assertAllowedDevice(device);
+        const session = await readSession(context, device);
+        const now = new Date().toISOString();
+        if (!session) {
+          await stopHolder(null, sessionPtyPath(device)); // clear any stray link
+          context.logger.info("No session holder recorded on {device}", {
+            device,
+          });
+          return { dataHandles: [] };
+        }
+        await stopHolder(session.holderPid, session.ptyLink);
+        context.logger.info("Session holder stopped on {device} (pid {pid})", {
+          device,
+          pid: session.holderPid,
+        });
+        const handle = await context.writeResource(
+          "session",
+          instanceKey("session", device),
+          {
+            device: session.device,
+            ptyLink: session.ptyLink,
+            holderPid: session.holderPid,
+            baud: session.baud,
+            framing: session.framing,
+            lineEnding: session.lineEnding,
+            startedAt: session.startedAt,
+            live: false,
+            checkedAt: now,
+            stoppedAt: now,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    session_status: {
+      description:
+        "Report whether a persistent session holder is running on the port. Recomputes liveness from the holder pid + PTY link (a dead holder reads as not-live and I/O methods fall back to open/close).",
+      arguments: z.object({ ...OverrideArgs }),
+      execute: async (
+        args: Overrides,
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const device = args.device ?? context.globalArgs.device;
+        assertAllowedDevice(device);
+        const session = await readSession(context, device);
+        const now = new Date().toISOString();
+        if (!session) {
+          context.logger.info("No session holder on {device}", { device });
+          return { dataHandles: [] };
+        }
+        const live = await isSessionLive(session);
+        context.logger.info("Session on {device}: {state} (pid {pid})", {
+          device,
+          state: live ? "live" : "dead",
+          pid: session.holderPid,
+        });
+        const handle = await context.writeResource(
+          "session",
+          instanceKey("session", device),
+          {
+            device: session.device,
+            ptyLink: session.ptyLink,
+            holderPid: session.holderPid,
+            baud: session.baud,
+            framing: session.framing,
+            lineEnding: session.lineEnding,
+            startedAt: session.startedAt,
+            live,
+            checkedAt: now,
+            ...(session.stoppedAt ? { stoppedAt: session.stoppedAt } : {}),
           },
         );
         return { dataHandles: [handle] };
