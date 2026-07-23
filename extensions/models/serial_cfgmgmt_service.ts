@@ -33,8 +33,9 @@ export async function queryService(
   const unit = name.replace(/[^\w.@:-]/g, "");
   const active = (await session.run(`systemctl is-active ${unit} 2>/dev/null`))
     .stdout.trim() || "unknown";
-  const enabled = (await session.run(`systemctl is-enabled ${unit} 2>/dev/null`))
-    .stdout.trim() || "unknown";
+  const enabled =
+    (await session.run(`systemctl is-enabled ${unit} 2>/dev/null`))
+      .stdout.trim() || "unknown";
   return { activeState: active, enabledState: enabled };
 }
 
@@ -52,8 +53,9 @@ async function control(
 /** Build a mutating method definition for one systemctl action. */
 function actionMethod(action: Action) {
   return {
-    description:
-      `${action[0].toUpperCase()}${action.slice(1)} a systemd unit on the target (MUTATING; assumes a privileged shell). Records resulting state.`,
+    description: `${action[0].toUpperCase()}${
+      action.slice(1)
+    } a systemd unit on the target (MUTATING; assumes a privileged shell). Records resulting state.`,
     arguments: z.object({
       name: z.string().min(1).describe("systemd unit name, e.g. sshd.service."),
     }),
@@ -63,7 +65,9 @@ function actionMethod(action: Action) {
         const res = await control(session, action, args.name);
         if (res.exitCode !== 0) {
           throw new Error(
-            `systemctl ${action} ${args.name} failed (rc=${res.exitCode}): ${res.stdout.slice(-400)}`,
+            `systemctl ${action} ${args.name} failed (rc=${res.exitCode}): ${
+              res.stdout.slice(-400)
+            }`,
           );
         }
         return await queryService(session, args.name);
@@ -95,7 +99,7 @@ function actionMethod(action: Action) {
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/service",
-  version: "2026.07.22.1",
+  version: "2026.07.22.2",
   globalArguments: z.object({ ...ConnectionGlobals }),
   resources: {
     service: {
@@ -110,7 +114,9 @@ export const model = {
       description:
         "Read a systemd unit's active and enabled state (read-only).",
       arguments: z.object({
-        name: z.string().min(1).describe("systemd unit name, e.g. sshd.service."),
+        name: z.string().min(1).describe(
+          "systemd unit name, e.g. sshd.service.",
+        ),
       }),
       execute: async (args: { name: string }, context: Ctx) => {
         const g = context.globalArgs;

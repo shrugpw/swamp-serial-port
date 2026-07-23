@@ -102,11 +102,12 @@ export async function gatherFacts(
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/node",
-  version: "2026.07.22.1",
+  version: "2026.07.22.2",
   globalArguments: z.object({ ...ConnectionGlobals }),
   resources: {
     info: {
-      description: "System facts gathered from the node over the serial console.",
+      description:
+        "System facts gathered from the node over the serial console.",
       schema: InfoSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,

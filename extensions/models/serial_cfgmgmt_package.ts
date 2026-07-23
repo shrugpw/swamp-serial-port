@@ -85,7 +85,7 @@ export function installCommand(manager: Manager, name: string): string {
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/package",
-  version: "2026.07.22.1",
+  version: "2026.07.22.2",
   globalArguments: z.object({ ...ConnectionGlobals }),
   resources: {
     package: {
@@ -147,7 +147,9 @@ export const model = {
             const res = await session.run(installCommand(manager, args.name));
             if (res.exitCode !== 0) {
               throw new Error(
-                `Install of "${args.name}" via ${manager} failed (rc=${res.exitCode}): ${res.stdout.slice(-400)}`,
+                `Install of "${args.name}" via ${manager} failed (rc=${res.exitCode}): ${
+                  res.stdout.slice(-400)
+                }`,
               );
             }
           }

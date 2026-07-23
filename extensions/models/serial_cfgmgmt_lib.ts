@@ -27,8 +27,8 @@ import {
   drainUntil,
   execOn,
   loginOn,
-  type SerialPort,
   selectTransport,
+  type SerialPort,
   sessionLinkLive,
   sessionPtyPath,
   withPort,
@@ -38,6 +38,7 @@ import {
 const FRAMING_RE = /^[5-8][NEO][12]$/;
 
 /** CSI / bracketed-paste escape sequences a console interleaves with output. */
+// deno-lint-ignore no-control-regex -- \x1b (ESC) is the ANSI escape we strip.
 export const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
 /** Matches the trailing shell-prompt line after right-trim (…`~]$`, `#`, `>`). */
@@ -310,7 +311,9 @@ export async function withSession<T>(
         const idle = attached ? SESSION_DRAIN_IDLE_MS : g.settleMs;
         await settle(port, {
           settleMs: idle,
-          maxMs: attached ? SESSION_DRAIN_MAX_MS : Math.max(g.settleMs * 8, 2000),
+          maxMs: attached
+            ? SESSION_DRAIN_MAX_MS
+            : Math.max(g.settleMs * 8, 2000),
         });
       }
 

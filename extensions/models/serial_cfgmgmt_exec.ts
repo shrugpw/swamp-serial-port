@@ -8,7 +8,11 @@
  * @module
  */
 import { z } from "npm:zod@4";
-import { ConnectionGlobals, type Ctx, withSession } from "./serial_cfgmgmt_lib.ts";
+import {
+  ConnectionGlobals,
+  type Ctx,
+  withSession,
+} from "./serial_cfgmgmt_lib.ts";
 
 const ResultSchema = z.object({
   command: z.string(),
@@ -19,7 +23,7 @@ const ResultSchema = z.object({
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/exec",
-  version: "2026.07.22.1",
+  version: "2026.07.22.2",
   globalArguments: z.object({ ...ConnectionGlobals }),
   resources: {
     result: {

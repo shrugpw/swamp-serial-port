@@ -644,12 +644,19 @@ function holderLogPath(device: string): string {
 /** Translate line config into socat serial address options (mirrors stty). */
 export function socatDeviceOpts(cfg: PortConfig): string {
   const m = /^([5-8])([NEO])([12])$/.exec(cfg.framing);
-  if (!m) throw new Error(`Invalid framing "${cfg.framing}" (expected e.g. 8N1)`);
+  if (!m) {
+    throw new Error(`Invalid framing "${cfg.framing}" (expected e.g. 8N1)`);
+  }
   const [, bits, parity, stop] = m;
   const opts = ["raw", "echo=0", `b${cfg.baud}`, `cs${bits}`];
   if (parity === "N") opts.push("parenb=0");
   else opts.push("parenb=1", parity === "O" ? "parodd=1" : "parodd=0");
-  opts.push(`cstopb=${stop === "2" ? 1 : 0}`, "clocal=1", "crtscts=0", "hupcl=0");
+  opts.push(
+    `cstopb=${stop === "2" ? 1 : 0}`,
+    "clocal=1",
+    "crtscts=0",
+    "hupcl=0",
+  );
   return opts.join(",");
 }
 
@@ -1053,7 +1060,7 @@ function transportFor(context: MethodContext): Transport {
 /** Model definition for the @shrug/serial-port USB-UART model type. */
 export const model = {
   type: "@shrug/serial-port",
-  version: "2026.07.22.1",
+  version: "2026.07.22.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     port: {
