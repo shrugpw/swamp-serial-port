@@ -410,6 +410,48 @@ Deno.test("drainUntil over ringReadPort: short reads across 4096 boundaries accu
   }
 });
 
+Deno.test("exec-over-ring: a stale prompt appended after the offset is drained first, not matched as the response (live-proof regression)", async () => {
+  // On hardware, the drainer appends a PREVIOUS interaction's prompt to the ring
+  // just after ringReadPort records its offset; without a settle, read-forward
+  // matches that stale prompt's sentinel instead of THIS command's response.
+  const ring = await Deno.makeTempFile();
+  try {
+    await writeFixture(ring, new Uint8Array(0));
+    const writes: Uint8Array[] = [];
+    const port = await ringReadPort(stubPty(writes), ring); // records pos=0
+    // Drainer latency: the stale trailing prompt lands AFTER the offset.
+    await Deno.writeFile(
+      ring,
+      new TextEncoder().encode("\x1b[?2004h[fedora@host ~]$ "),
+      { append: true },
+    );
+    // The fix: settle the ring to idle before writing (what exec/login now do).
+    await drainUntil(port, { idleMs: 100, maxMs: 2000 }, fakeClock());
+    // Now the command's real response arrives and must be what execOn returns.
+    await Deno.writeFile(
+      ring,
+      new TextEncoder().encode("uname -r\n6.16.4\n[fedora@host ~]$ "),
+      { append: true },
+    );
+    const r = await execOn(
+      port,
+      {
+        command: "uname -r",
+        lineEnding: "\n",
+        prompt: /\][$#>] $/,
+        idleMs: 200,
+        maxMs: 3000,
+        stripEcho: false,
+      },
+      fakeClock(),
+    );
+    assertEquals(r.matchedPrompt, true);
+    assertEquals(r.output.includes("6.16.4"), true); // the response, not the stale prompt
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
 Deno.test("computeReadPlan: an offset recorded before a rotation resolves through the captureBase bump", () => {
   // Cursor 50 recorded when captureBase=0. The file holding [0,100) rotates to
   // .1 → captureBase=100, prevSize=100. Offset 50 must still resolve into .1.

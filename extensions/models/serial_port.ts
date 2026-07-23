@@ -1475,13 +1475,17 @@ export const model = {
           transportFor(context),
           ioCfg,
           async (port) => {
-            // Under capture, record the ring end and read the response forward
-            // from there; the drainer is the sole PTY reader, so the §2b
-            // per-call stale-drain is retired (nothing else buffers the PTY).
+            // Read the response forward from the ring (under capture) or the PTY.
+            // Settle the source to idle FIRST: a trailing prompt from the
+            // previous interaction can land past the offset ringReadPort just
+            // recorded (the drainer appends with latency), and read-forward would
+            // otherwise match that stale prompt's sentinel instead of THIS
+            // command's response — proven on hardware. Draining rport advances
+            // past it (the ring when capturing, else the PTY, same as §2b).
             const rport = capturing && ringPath
               ? await ringReadPort(port, ringPath)
               : port;
-            if (attached && !capturing) await drainStaleOnAttach(port);
+            if (attached) await drainStaleOnAttach(rport);
             return execOn(rport, {
               command: args.command,
               lineEnding: cfg.lineEnding,
@@ -1567,7 +1571,9 @@ export const model = {
               const rport = capturing && ringPath
                 ? await ringReadPort(port, ringPath)
                 : port;
-              if (attached && !capturing) await drainStaleOnAttach(port);
+              // Settle the source before answering the getty (see exec) so a
+              // stale trailing prompt is not read as the login:/Password: phase.
+              if (attached) await drainStaleOnAttach(rport);
               return loginOn(rport, {
                 username,
                 password,
