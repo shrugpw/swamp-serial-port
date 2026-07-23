@@ -129,19 +129,25 @@ const MountResultSchema = z.object({
 
 /**
  * Expected identity of a target device, asserted before any live write. Must
- * carry at least one identifying field — an empty `{}` would confirm nothing, so
- * it is rejected rather than silently letting a live write through unverified.
+ * carry at least one device-**unique** field (serial/model/sizeBytes): `empty`
+ * alone can't distinguish two different empty devices, and a bare `{}` (or a
+ * no-op `{ empty: false }`) would confirm nothing — all are rejected rather than
+ * silently letting a live write through unverified.
  */
 export const ConfirmDeviceSchema = z.object({
   serial: z.string().optional(),
   model: z.string().optional(),
   sizeBytes: z.number().optional(),
   empty: z.boolean().optional(),
-}).refine((o) => Object.values(o).some((v) => v !== undefined), {
-  message:
-    "confirmDevice must assert at least one of serial/model/sizeBytes/empty — " +
-    "an empty object confirms nothing and would defeat verify-before-destroy.",
-});
+}).refine(
+  (o) => o.serial !== undefined || o.model !== undefined || o.sizeBytes !== undefined,
+  {
+    message:
+      "confirmDevice must assert at least one device-unique field " +
+      "(serial, model, or sizeBytes) — `empty` alone cannot distinguish which " +
+      "physical device you are touching, and would defeat verify-before-destroy.",
+  },
+);
 export type ConfirmDevice = z.infer<typeof ConfirmDeviceSchema>;
 
 /**
@@ -151,10 +157,12 @@ export type ConfirmDevice = z.infer<typeof ConfirmDeviceSchema>;
  * characters. These are enforced both at the zod schema layer (early, friendly
  * error) and again in-method as a hard backstop.
  */
-export const SAFE_PATH_RE = /^[A-Za-z0-9._@:+/=-]+$/;
-export const SAFE_LABEL_RE = /^[A-Za-z0-9._-]+$/;
-/** Options / mkfs-args: adds space and comma; still no `;|&$<>()\`"'\\` etc. */
-export const SAFE_OPTS_RE = /^[A-Za-z0-9._@:+/=, -]*$/;
+// The leading char must not be `-`, so a value can't smuggle an extra flag into
+// a command where it's a bare positional argument (e.g. `--reference=/etc/shadow`).
+export const SAFE_PATH_RE = /^[A-Za-z0-9._@:+/=][A-Za-z0-9._@:+/=-]*$/;
+export const SAFE_LABEL_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/;
+/** Options / mkfs-args: adds space and comma; still no `;|&$<>()\`"'\\` or leading `-`. */
+export const SAFE_OPTS_RE = /^(?:[A-Za-z0-9._@:+/=,][A-Za-z0-9._@:+/=, -]*)?$/;
 
 /** Throw unless `value` matches `re`; used as an in-method backstop. */
 export function assertSafe(value: string, re: RegExp, kind: string): void {
@@ -240,14 +248,14 @@ function mapBlockNode(node: Record<string, unknown>): BlockDevice {
 
 /** Parse `lsblk -J -O -b` JSON into the block-device tree. Tolerates junk. */
 export function parseLsblk(raw: string): BlockDevice[] {
-  const json = extractJson(raw);
+  const json = extractJson(raw, "blockdevices");
   if (!json || !Array.isArray(json["blockdevices"])) return [];
   return (json["blockdevices"] as Record<string, unknown>[]).map(mapBlockNode);
 }
 
 /** Parse `findmnt --real -J -b …` JSON into a flat mount list. */
 export function parseFindmnt(raw: string): Mount[] {
-  const json = extractJson(raw);
+  const json = extractJson(raw, "filesystems");
   if (!json || !Array.isArray(json["filesystems"])) return [];
   const out: Mount[] = [];
   const walk = (n: Record<string, unknown>) => {
@@ -325,7 +333,10 @@ export function parseBtrfs(
  * stray brace in a prompt/printk line before the real payload), advances to the
  * next `{` and retries rather than giving up.
  */
-function extractJson(raw: string): Record<string, unknown> | null {
+function extractJson(
+  raw: string,
+  requireKey?: string,
+): Record<string, unknown> | null {
   let from = raw.indexOf("{");
   while (from >= 0) {
     let depth = 0, inStr = false, esc = false, end = -1;
@@ -349,7 +360,11 @@ function extractJson(raw: string): Record<string, unknown> | null {
     }
     if (end >= 0) {
       try {
-        return JSON.parse(raw.slice(from, end + 1)) as Record<string, unknown>;
+        const obj = JSON.parse(raw.slice(from, end + 1)) as Record<string, unknown>;
+        // Skip a stray but valid object (e.g. `{}` in prompt residue) that
+        // lacks the payload key the caller expects — keep scanning for the real
+        // one rather than degrading the facet to empty.
+        if (!requireKey || requireKey in obj) return obj;
       } catch {
         // This brace group wasn't valid JSON — try the next `{`.
       }
@@ -415,11 +430,14 @@ export function identityMismatches(
       `size mismatch: confirmDevice=${confirm.sizeBytes} live=${dev.sizeBytes ?? "(unknown)"}`,
     );
   }
-  if (confirm.empty === true && !isEmpty(dev)) {
+  // `empty` is a real bidirectional assertion: empty:true must be empty,
+  // empty:false must NOT be empty. (Treating false as a no-op would let
+  // `{ empty: false }` pass while asserting nothing.)
+  if (confirm.empty != null && confirm.empty !== isEmpty(dev)) {
     reasons.push(
-      `device is not empty (has ${
-        dev.fstype ? `fstype=${dev.fstype}` : `${dev.children.length} partition(s)`
-      } or is mounted) but confirmDevice.empty=true`,
+      `emptiness mismatch: confirmDevice.empty=${confirm.empty} but live device ${
+        isEmpty(dev) ? "is empty" : "is not empty"
+      }`,
     );
   }
   return reasons;
@@ -517,8 +535,11 @@ export interface FormatMountArgs {
 /**
  * Pure preview of `format_mount`: the ordered shell commands and the fstab line.
  * The new filesystem's UUID isn't known until mkfs runs, so the fstab step uses
- * the `{{NEW_UUID}}` token; the live executor reuses this exact list and
- * substitutes the UUID it reads back with `blkid`, so plan ≡ execution.
+ * the `{{NEW_UUID}}` token (the live executor substitutes the UUID it reads back
+ * with `blkid`). This is a faithful preview of what the live path does; the two
+ * are kept in step by tests asserting the plan's contents — not by the executor
+ * literally replaying this array (the UUID/fstab-merge steps aren't plain
+ * commands), so treat it as an audit preview, not a byte-for-byte script.
  */
 export function planFormatMount(
   _facts: StorageFacts,
@@ -595,8 +616,9 @@ export function planRelocateSubvol(
     `btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
     `sync`,
     // pipefail so a failing `send` isn't masked by a succeeding `receive`
-    // (bash `$?` is the last stage's status without it).
-    `set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount}`,
+    // (bash `$?` is the last stage's status without it). Scoped to a SUBSHELL so
+    // it doesn't persist into later commands of the held session shell.
+    `( set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount} )`,
     `btrfs subvolume show ${snapPath}`,
     `btrfs subvolume show ${received}`,
     `find ${snapPath} -xdev | wc -l`,
@@ -688,7 +710,7 @@ export function b64encode(text: string): string {
  * file and wedging the shell). The base64 form is one command with no delimiter
  * to break and no shell-metacharacter exposure (base64 is `[A-Za-z0-9+/=]`).
  */
-async function persistFstab(
+export async function persistFstab(
   session: Session,
   mountpoint: string,
   line: string,
@@ -1090,6 +1112,7 @@ export const model = {
         }
         assertSafe(args.sourceSubvol, SAFE_PATH_RE, "sourceSubvol");
         assertSafe(args.targetMount, SAFE_PATH_RE, "targetMount");
+        if (args.snapshotName) assertSafe(args.snapshotName, SAFE_LABEL_RE, "snapshotName");
         if (args.finalMountpoint) {
           assertSafe(args.finalMountpoint, SAFE_PATH_RE, "finalMountpoint");
         }
@@ -1136,9 +1159,11 @@ export const model = {
           await step("sync");
           // send|receive is a single local pipeline; it can run long with no
           // intermediate output — the session's maxMs bound applies. pipefail so
-          // a failing `send` isn't masked by a succeeding `receive`.
+          // a failing `send` isn't masked by a succeeding `receive`; in a
+          // subshell so the option doesn't leak into later session commands
+          // (e.g. the `find|wc` / `du|cut` verify pipelines below).
           await step(
-            `set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount}`,
+            `( set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount} )`,
           );
 
           // Verify (never trust the exit code alone):
@@ -1173,15 +1198,15 @@ export const model = {
 
           let fstab: { replaced: number; backup: string } | null = null;
           let fstabLine: string | null = null;
+          // The received subvol's fs-root-relative path (btrfs subvolume show
+          // prints it as the first, colon-free line) — correct even if the
+          // target isn't mounted at the btrfs top level. Falls back to the
+          // basename for the top-level-mount case.
+          const subvolFsPath = dstShow.split("\n")
+            .map((l) => l.trim())
+            .find((l) => l !== "" && !l.includes(":")) ?? snapBase;
           if (args.repoint) {
             const mp = args.finalMountpoint ?? args.sourceSubvol;
-            // The received subvol's fs-root-relative path (btrfs subvolume show
-            // prints it as the first, colon-free line) — correct even if the
-            // target isn't mounted at the btrfs top level. Falls back to the
-            // basename for the top-level-mount case.
-            const subvolFsPath = dstShow.split("\n")
-              .map((l) => l.trim())
-              .find((l) => l !== "" && !l.includes(":")) ?? snapBase;
             const src0 = targetMount.source.replace(/\[.*$/, "");
             const fsUuid =
               (await step(`blkid -c /dev/null -s UUID -o value ${src0}`)).stdout.trim();
@@ -1200,7 +1225,7 @@ export const model = {
             source: received,
             uuid: rcvUuid,
             fstype: "btrfs",
-            options: fstabLine ? ensureNofail(`subvol=${snapBase}`) : null,
+            options: fstabLine ? ensureNofail(`subvol=${subvolFsPath}`) : null,
             verifiedAt: new Date().toISOString(),
             details: {
               snapshot: snapPath,

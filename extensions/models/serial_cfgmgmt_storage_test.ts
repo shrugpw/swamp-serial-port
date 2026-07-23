@@ -30,6 +30,7 @@ import {
   isMounted,
   mergeFstab,
   parseBtrfs,
+  persistFstab,
   parseFindmnt,
   parseLsblk,
   partitionPath,
@@ -482,10 +483,29 @@ Deno.test("F1: b64encode round-trips fstab content (no heredoc write)", () => {
   assert(/^[A-Za-z0-9+/=]+$/.test(b64encode(content)));
 });
 
-Deno.test("F2: confirmDevice rejects an empty object, accepts one identifying field", () => {
+Deno.test("F2: confirmDevice needs a device-unique field; {} and {empty:*} alone are rejected", () => {
   assertEquals(ConfirmDeviceSchema.safeParse({}).success, false);
+  // `empty` alone (true OR false) can't distinguish a device — rejected.
+  assertEquals(ConfirmDeviceSchema.safeParse({ empty: true }).success, false);
+  assertEquals(ConfirmDeviceSchema.safeParse({ empty: false }).success, false);
+  // A device-unique field is required; empty may accompany it.
   assertEquals(ConfirmDeviceSchema.safeParse({ serial: "x" }).success, true);
-  assertEquals(ConfirmDeviceSchema.safeParse({ empty: true }).success, true);
+  assertEquals(ConfirmDeviceSchema.safeParse({ sizeBytes: 1 }).success, true);
+  assertEquals(ConfirmDeviceSchema.safeParse({ serial: "x", empty: true }).success, true);
+});
+
+Deno.test("F2: empty is a bidirectional assertion (empty:false must NOT be empty)", () => {
+  const f = facts();
+  const spare = findDevice(f.blockDevices, "/dev/mmcblk2")!; // empty
+  const root = findDevice(f.blockDevices, "/dev/mmcblk1")!; // not empty
+  // empty:false against a genuinely-empty device is now a REAL mismatch (was a
+  // no-op that defeated verify-before-destroy).
+  assert(identityMismatches(spare, { serial: "0xcccc0003", empty: false }, "/dev/mmcblk2").length > 0);
+  // empty:false against a non-empty device agrees.
+  assertEquals(
+    identityMismatches(root, { serial: "0xbbbb0002", empty: false }, "/dev/mmcblk1"),
+    [],
+  );
 });
 
 Deno.test("F2: identityMismatches has NO mounted-refusal and matches on the DISK node", () => {
@@ -534,11 +554,17 @@ Deno.test("F4: assertSafe blocks shell metacharacters; SAFE_* regexes are strict
   assertThrows(() => assertSafe("/mnt/$(id)", SAFE_PATH_RE, "mountpoint"));
   assertThrows(() => assertSafe("/mnt/a b", SAFE_PATH_RE, "mountpoint")); // whitespace
   assertThrows(() => assertSafe("a`b`", SAFE_LABEL_RE, "label"));
+  // leading-dash flag injection is rejected (e.g. `--reference=/etc/shadow`).
+  assertThrows(() => assertSafe("--reference=/etc/shadow", SAFE_PATH_RE, "device"));
+  assertThrows(() => assertSafe("-rf", SAFE_PATH_RE, "mountpoint"));
+  assertThrows(() => assertSafe("--help", SAFE_LABEL_RE, "label"));
+  assert(!SAFE_OPTS_RE.test("-o"));
   // clean values pass
   assertSafe("/dev/mmcblk2", SAFE_PATH_RE, "device");
   assertSafe("scratch", SAFE_LABEL_RE, "label");
   assertSafe("defaults,nofail,x-systemd.device-timeout=30s", SAFE_OPTS_RE, "opts");
   assert(!SAFE_OPTS_RE.test("defaults;evil"));
+  assertSafe("", SAFE_OPTS_RE, "opts"); // empty opts still allowed
 });
 
 Deno.test("F8: mergeFstab treats /mnt/x and /mnt/x/ as the same mountpoint", () => {
@@ -553,4 +579,40 @@ Deno.test("F11: extractJson skips a leading stray brace in console residue", () 
   const noisy = "[root@board-01 ~]# lsblk -J\n{stray prompt brace}\n" + LSBLK;
   const devs = parseLsblk(noisy);
   assertEquals(devs.length, 3); // finds the real payload past the junk brace group
+});
+
+Deno.test("F11: extractJson skips a stray VALID-but-wrong object (requireKey)", () => {
+  // A valid `{}` in residue must not shadow the real lsblk payload.
+  const noisy = 'echo {}\n{}\n' + LSBLK;
+  assertEquals(parseLsblk(noisy).length, 3);
+});
+
+Deno.test("F1: persistFstab writes via base64 (no heredoc) and reports rc failure", async () => {
+  const routes: Array<[RegExp, CommandResult]> = [
+    [/^cat \/etc\/fstab$/, ok("UUID=keep / btrfs defaults 0 0\n")],
+    [/^cp -a \/etc\/fstab \/etc\/fstab\.swamp-bak\./, ok("")],
+    [/base64 -d > \/etc\/fstab$/, ok("")],
+  ];
+  const s = fakeSession(routes);
+  const line = buildFstabLine({ uuid: "u", mountpoint: "/mnt/x", fstype: "btrfs", options: "defaults" });
+  const r = await persistFstab(s, "/mnt/x", line);
+  assertEquals(r.replaced, 0);
+  assertStringIncludes(r.backup, "/etc/fstab.swamp-bak.");
+  // The write is a single base64 pipeline — NO heredoc delimiter to break.
+  const write = s.calls.find((c) => c.includes("base64 -d > /etc/fstab"))!;
+  assertStringIncludes(write, "printf '%s' '");
+  assert(!s.calls.some((c) => c.includes("<<")));
+  // A nonzero write rc must throw (not silently leave fstab wrong).
+  const bad = fakeSession([
+    [/^cat \/etc\/fstab$/, ok("")],
+    [/^cp -a/, ok("")],
+    [/base64 -d > \/etc\/fstab$/, { stdout: "no space", exitCode: 1 }],
+  ]);
+  let threw = false;
+  try {
+    await persistFstab(bad, "/mnt/x", line);
+  } catch {
+    threw = true;
+  }
+  assert(threw);
 });
