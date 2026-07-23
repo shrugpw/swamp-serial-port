@@ -244,6 +244,28 @@ Deno.test("parseBtrfs tolerates empty output (no btrfs)", () => {
   assertEquals(parseBtrfs("", []), []);
 });
 
+Deno.test("parseBtrfs attributes subvols to the right fs by device (multi-fs board)", () => {
+  // The bpif3-004 shape: a boot btrfs + a separate nvme-var btrfs.
+  const show =
+    "Label: 'fedora'  uuid: aaaa-1\n\tTotal devices 1 FS bytes used 100\n" +
+    "\tdevid    1 size 1000 used 500 path /dev/mmcblk0p3\n" +
+    "Label: 'nvme-var'  uuid: bbbb-2\n\tTotal devices 1 FS bytes used 200\n" +
+    "\tdevid    1 size 2000 used 800 path /dev/nvme0n1p1\n";
+  const rootList = "ID 256 gen 5 top level 5 path root\nID 258 gen 6 top level 5 path home\n";
+  const varList = "ID 257 gen 7 top level 5 path var\n";
+  const fss = parseBtrfs(show, [
+    { mount: "/", device: "/dev/mmcblk0p3", stdout: rootList },
+    { mount: "/home", device: "/dev/mmcblk0p3", stdout: rootList },
+    { mount: "/var", device: "/dev/nvme0n1p1", stdout: varList },
+  ]);
+  assertEquals(fss.length, 2);
+  const fedora = fss.find((f) => f.label === "fedora")!;
+  const nvme = fss.find((f) => f.label === "nvme-var")!;
+  // subvols land on their OWN fs (not all dumped on the first one), deduped.
+  assertEquals(fedora.subvolumes.map((s) => s.path).sort(), ["home", "root"]);
+  assertEquals(nvme.subvolumes.map((s) => s.path), ["var"]);
+});
+
 // ————————————————————————————————————————————————————————————————
 // Collector
 // ————————————————————————————————————————————————————————————————

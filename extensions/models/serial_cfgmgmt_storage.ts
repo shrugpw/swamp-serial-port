@@ -306,14 +306,28 @@ export function parseFindmnt(raw: string): Mount[] {
   return out;
 }
 
+/** Parse the subvolumes out of one `btrfs subvolume list` stdout. */
+function parseSubvolLines(
+  stdout: string,
+): Array<{ id: number; parentId?: number; path: string }> {
+  const out: Array<{ id: number; parentId?: number; path: string }> = [];
+  for (const l of stdout.split("\n")) {
+    const m = l.match(/^ID\s+(\d+)\s+gen\s+\d+\s+top level\s+(\d+)\s+path\s+(.+)$/);
+    if (m) out.push({ id: Number(m[1]), parentId: Number(m[2]), path: m[3].trim() });
+  }
+  return out;
+}
+
 /**
  * Parse `btrfs filesystem show --raw` + per-mount `btrfs subvolume list -o`
- * output into the btrfs facet. `subvolLists` maps a mountpoint to that mount's
- * `subvolume list` stdout. Best-effort: unparseable lines are skipped.
+ * output into the btrfs facet. Each `subvolLists` entry carries the mount's
+ * backing `device` so subvolumes are attributed to the right filesystem when a
+ * board has more than one btrfs (e.g. a boot fs plus a data fs) — the list
+ * output alone doesn't name its fs. Best-effort: unparseable lines are skipped.
  */
 export function parseBtrfs(
   showRaw: string,
-  subvolLists: Array<{ mount: string; stdout: string }>,
+  subvolLists: Array<{ mount: string; device?: string; stdout: string }>,
 ): BtrfsFs[] {
   const fss: BtrfsFs[] = [];
   let cur: BtrfsFs | null = null;
@@ -332,25 +346,24 @@ export function parseBtrfs(
     const dev = line.match(/^\s*devid\s+\d+.*\bpath\s+(\S+)/);
     if (dev && cur) cur.devices.push(dev[1]);
   }
-  // Subvolumes aren't tied to a specific fs by the list output alone; attach all
-  // parsed subvols to the single fs when there is exactly one, else leave them
-  // off (the block-device tree already carries the mount topology). Dedup by id:
-  // `subvolume list -o` is probed once per btrfs mount, so the same subvol shows
-  // up in several lists (e.g. both `/` and `/var`).
-  const byId = new Map<number, { id: number; parentId?: number; path: string }>();
-  for (const { stdout } of subvolLists) {
-    for (const l of stdout.split("\n")) {
-      const m = l.match(/^ID\s+(\d+)\s+gen\s+\d+\s+top level\s+(\d+)\s+path\s+(.+)$/);
-      if (m) {
-        const id = Number(m[1]);
-        if (!byId.has(id)) {
-          byId.set(id, { id, parentId: Number(m[2]), path: m[3].trim() });
-        }
+  // Attribute each subvol list to its filesystem by matching the mount's backing
+  // device to the fs's member devices. Dedup by id within a fs (the same subvol
+  // shows up in the list for every mount of that fs, e.g. `/` and `/home`).
+  for (const fs of fss) {
+    const byId = new Map<number, { id: number; parentId?: number; path: string }>();
+    for (const entry of subvolLists) {
+      // Match by device; if no device was supplied and there's exactly one fs,
+      // fall back to attaching (single-fs boards / callers without a device).
+      const belongs = entry.device
+        ? fs.devices.includes(entry.device)
+        : fss.length === 1;
+      if (!belongs) continue;
+      for (const sv of parseSubvolLines(entry.stdout)) {
+        if (!byId.has(sv.id)) byId.set(sv.id, sv);
       }
     }
+    fs.subvolumes = [...byId.values()];
   }
-  const subvols = [...byId.values()];
-  if (fss.length === 1 && subvols.length) fss[0].subvolumes = subvols;
   return fss;
 }
 
@@ -711,11 +724,19 @@ export async function collectStorage(
   let btrfs: BtrfsFs[] = [];
   if (btrfsMounts.length) {
     const show = (await run(`${bp}btrfs filesystem show --raw 2>/dev/null`)).stdout;
-    const subvolLists: Array<{ mount: string; stdout: string }> = [];
+    const subvolLists: Array<{ mount: string; device: string; stdout: string }> = [];
     for (const m of btrfsMounts) {
+      // No `-o`: list ALL subvolumes of the filesystem containing this mount
+      // (paths fs-root-relative). `-o` would only show subvols *below* the mount
+      // in the subvol tree, missing siblings like root/home/var.
       const out =
-        (await run(`${bp}btrfs subvolume list -o ${m.target} 2>/dev/null`)).stdout;
-      subvolLists.push({ mount: m.target, stdout: out });
+        (await run(`${bp}btrfs subvolume list ${m.target} 2>/dev/null`)).stdout;
+      // strip findmnt's `[/subvol]` suffix → the backing partition device.
+      subvolLists.push({
+        mount: m.target,
+        device: m.source.replace(/\[.*$/, ""),
+        stdout: out,
+      });
     }
     btrfs = parseBtrfs(show, subvolLists);
   }
