@@ -17,6 +17,7 @@ import { type CommandResult, type Session } from "./serial_cfgmgmt_lib.ts";
 import {
   assertSafe,
   b64encode,
+  becomePrefix,
   buildFstabLine,
   collectStorage,
   confirmMatches,
@@ -593,11 +594,73 @@ Deno.test("F11: extractJson skips a stray VALID-but-wrong object (requireKey)", 
   assertEquals(parseLsblk(noisy).length, 3);
 });
 
+// ————————————————————————————————————————————————————————————————
+// become (privilege escalation) — surfaced by live proof on bpif3-004
+// ————————————————————————————————————————————————————————————————
+
+Deno.test("becomePrefix: off is empty, sudo is non-interactive, doas is doas", () => {
+  assertEquals(becomePrefix(false, "sudo"), "");
+  assertEquals(becomePrefix(true, "sudo"), "sudo -n ");
+  assertEquals(becomePrefix(true, "doas"), "doas ");
+});
+
+Deno.test("become: planners prefix privileged commands (btrfs/mkfs/wipefs/find/du)", () => {
+  const fm = planFormatMount(facts(), {
+    device: "/dev/mmcblk2",
+    partition: true,
+    fstype: "btrfs",
+    mountpoint: "/mnt/scratch",
+    wipe: true,
+  }, "sudo -n ");
+  assert(fm.orderedCommands.some((c) => c.startsWith("sudo -n wipefs")));
+  assert(fm.orderedCommands.some((c) => c.startsWith("sudo -n parted")));
+  assert(fm.orderedCommands.some((c) => c.startsWith("sudo -n mkfs.btrfs")));
+  assert(fm.orderedCommands.some((c) => c.startsWith("sudo -n blkid")));
+  assert(fm.orderedCommands.some((c) => c.startsWith("sudo -n mount ")));
+
+  const rel = planRelocateSubvol(facts(), {
+    sourceSubvol: "/var",
+    targetMount: "/mnt/newdisk",
+    repoint: false,
+  }, "sudo -n ");
+  // both pipeline stages escalated, inside the pipefail subshell
+  assert(rel.orderedCommands.some((c) =>
+    c.includes("( set -o pipefail; sudo -n btrfs send") && c.includes("| sudo -n btrfs receive")
+  ));
+  assert(rel.orderedCommands.some((c) => c.startsWith("sudo -n btrfs subvolume snapshot")));
+  assert(rel.orderedCommands.some((c) => c.startsWith("sudo -n find")));
+  assert(rel.orderedCommands.some((c) => c.startsWith("sudo -n du")));
+});
+
+Deno.test("become: collectStorage escalates the btrfs probes only", async () => {
+  const s = fakeSession(FULL_ROUTES);
+  await collectStorage((c) => s.run(c), "sudo -n ");
+  // btrfs probes carry the prefix; lsblk/findmnt do not (work unprivileged).
+  assert(s.calls.some((c) => c.startsWith("sudo -n btrfs filesystem show")));
+  assert(s.calls.some((c) => c.startsWith("sudo -n btrfs subvolume list")));
+  assert(s.calls.some((c) => c.startsWith("lsblk")));
+  assert(!s.calls.some((c) => c.startsWith("sudo -n lsblk")));
+});
+
+Deno.test("become: persistFstab writes via `sudo -n tee` (privileged file write)", async () => {
+  const s = fakeSession([
+    [/cat \/etc\/fstab$/, ok("UUID=keep / btrfs defaults 0 0\n")],
+    [/cp -a \/etc\/fstab/, ok("")],
+    [/tee \/etc\/fstab/, ok("")],
+  ]);
+  const line = buildFstabLine({ uuid: "u", mountpoint: "/mnt/x", fstype: "btrfs", options: "defaults" });
+  await persistFstab(s, "/mnt/x", line, "sudo -n ");
+  assert(s.calls.some((c) => c.startsWith("sudo -n cat /etc/fstab")));
+  assert(s.calls.some((c) => c.startsWith("sudo -n cp -a /etc/fstab")));
+  assert(s.calls.some((c) => c.includes("| sudo -n tee /etc/fstab > /dev/null")));
+  assert(s.calls.some((c) => c.includes("base64 -d"))); // decode still happens
+});
+
 Deno.test("F1: persistFstab writes via base64 (no heredoc) and reports rc failure", async () => {
   const routes: Array<[RegExp, CommandResult]> = [
     [/^cat \/etc\/fstab$/, ok("UUID=keep / btrfs defaults 0 0\n")],
     [/^cp -a \/etc\/fstab \/etc\/fstab\.swamp-bak\./, ok("")],
-    [/base64 -d > \/etc\/fstab$/, ok("")],
+    [/tee \/etc\/fstab/, ok("")],
   ];
   const s = fakeSession(routes);
   const line = buildFstabLine({ uuid: "u", mountpoint: "/mnt/x", fstype: "btrfs", options: "defaults" });
@@ -605,14 +668,15 @@ Deno.test("F1: persistFstab writes via base64 (no heredoc) and reports rc failur
   assertEquals(r.replaced, 0);
   assertStringIncludes(r.backup, "/etc/fstab.swamp-bak.");
   // The write is a single base64 pipeline — NO heredoc delimiter to break.
-  const write = s.calls.find((c) => c.includes("base64 -d > /etc/fstab"))!;
+  const write = s.calls.find((c) => c.includes("tee /etc/fstab"))!;
   assertStringIncludes(write, "printf '%s' '");
+  assertStringIncludes(write, "base64 -d");
   assert(!s.calls.some((c) => c.includes("<<")));
   // A nonzero write rc must throw (not silently leave fstab wrong).
   const bad = fakeSession([
     [/^cat \/etc\/fstab$/, ok("")],
     [/^cp -a/, ok("")],
-    [/base64 -d > \/etc\/fstab$/, { stdout: "no space", exitCode: 1 }],
+    [/tee \/etc\/fstab/, { stdout: "no space", exitCode: 1 }],
   ]);
   let threw = false;
   try {

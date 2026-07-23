@@ -172,6 +172,26 @@ export const SAFE_OPTS_RE = /^(?:[A-Za-z0-9._@:+/=,][A-Za-z0-9._@:+/=, -]*)?$/;
  */
 export const SAFE_MKFS_ARGS_RE = /^[A-Za-z0-9._@:+/=, -]*$/;
 
+/** Privilege-escalation methods for `become` (the login user is unprivileged). */
+export type BecomeMethod = "sudo" | "doas";
+
+/**
+ * Command prefix that escalates privilege when `become` is set. `sudo -n` is
+ * non-interactive (fails fast rather than hanging on a password prompt over the
+ * console); `doas` is non-interactive by configuration. Empty when `become` is
+ * false (the session is already privileged, e.g. a root console).
+ */
+export function becomePrefix(become: boolean, method: BecomeMethod): string {
+  if (!become) return "";
+  return method === "doas" ? "doas " : "sudo -n ";
+}
+
+/** Resolve the become prefix from a method's globalArgs (untyped in Ctx). */
+function becomeOf(globalArgs: unknown): string {
+  const g = globalArgs as { become?: boolean; becomeMethod?: BecomeMethod };
+  return becomePrefix(g.become ?? false, g.becomeMethod ?? "sudo");
+}
+
 /** Throw unless `value` matches `re`; used as an in-method backstop. */
 export function assertSafe(value: string, re: RegExp, kind: string): void {
   if (!re.test(value)) {
@@ -552,26 +572,27 @@ export interface FormatMountArgs {
 export function planFormatMount(
   _facts: StorageFacts,
   args: FormatMountArgs,
+  bp = "",
 ): { orderedCommands: string[]; fstabLine: string; target: string } {
   const target = args.partition
     ? partitionPath(args.device)
     : args.device;
   const cmds: string[] = [];
-  if (args.wipe) cmds.push(`wipefs -a ${args.device}`);
+  if (args.wipe) cmds.push(`${bp}wipefs -a ${args.device}`);
   if (args.partition) {
     cmds.push(
-      `parted -s ${args.device} mklabel gpt mkpart primary 0% 100%`,
+      `${bp}parted -s ${args.device} mklabel gpt mkpart primary 0% 100%`,
     );
   }
-  const mkfs = [`mkfs.${args.fstype}`];
+  const mkfs = [`${bp}mkfs.${args.fstype}`];
   if (args.label) mkfs.push(`-L ${args.label}`);
   if (args.mkfsArgs) mkfs.push(args.mkfsArgs);
   mkfs.push(target);
   cmds.push(mkfs.join(" "));
   // `-c /dev/null` bypasses the blkid cache so a reformat never reads a stale
   // (previous-filesystem) UUID and writes it into fstab.
-  cmds.push(`blkid -c /dev/null -s UUID -o value ${target}`);
-  cmds.push(`mkdir -p ${args.mountpoint}`);
+  cmds.push(`${bp}blkid -c /dev/null -s UUID -o value ${target}`);
+  cmds.push(`${bp}mkdir -p ${args.mountpoint}`);
   const fstabLine = buildFstabLine({
     uuid: "{{NEW_UUID}}",
     mountpoint: args.mountpoint,
@@ -581,8 +602,8 @@ export function planFormatMount(
   cmds.push(
     `# back up /etc/fstab (timestamped), then idempotently add via base64: ${fstabLine}`,
   );
-  cmds.push(`mount ${args.mountpoint}`);
-  cmds.push(`findmnt --real -n ${args.mountpoint}`);
+  cmds.push(`${bp}mount ${args.mountpoint}`);
+  cmds.push(`${bp}findmnt --real -n ${args.mountpoint}`);
   return { orderedCommands: cmds, fstabLine, target };
 }
 
@@ -616,23 +637,25 @@ export function deriveSnapshotPath(
 export function planRelocateSubvol(
   facts: StorageFacts,
   args: RelocateArgs,
+  bp = "",
 ): { orderedCommands: string[]; fstabLine: string | null; snapPath: string } {
   const snapPath = deriveSnapshotPath(args.sourceSubvol, args.snapshotName);
   const snapBase = snapPath.slice(snapPath.lastIndexOf("/") + 1);
   const received = `${args.targetMount.replace(/\/+$/, "")}/${snapBase}`;
   const cmds = [
-    `btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
+    `${bp}btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
     `sync`,
     // pipefail so a failing `send` isn't masked by a succeeding `receive`
     // (bash `$?` is the last stage's status without it). Scoped to a SUBSHELL so
-    // it doesn't persist into later commands of the held session shell.
-    `( set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount} )`,
-    `btrfs subvolume show ${snapPath}`,
-    `btrfs subvolume show ${received}`,
-    `find ${snapPath} -xdev | wc -l`,
-    `find ${received} -xdev | wc -l`,
-    `du -sb ${snapPath} | cut -f1`,
-    `du -sb ${received} | cut -f1`,
+    // it doesn't persist into later commands of the held session shell. Each
+    // stage is privilege-escalated independently.
+    `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`,
+    `${bp}btrfs subvolume show ${snapPath}`,
+    `${bp}btrfs subvolume show ${received}`,
+    `${bp}find ${snapPath} -xdev | wc -l`,
+    `${bp}find ${received} -xdev | wc -l`,
+    `${bp}du -sb ${snapPath} | cut -f1`,
+    `${bp}du -sb ${received} | cut -f1`,
   ];
   let fstabLine: string | null = null;
   if (args.repoint) {
@@ -672,8 +695,11 @@ async function probeHost(run: Session["run"]): Promise<string> {
  */
 export async function collectStorage(
   run: Session["run"],
+  bp = "",
 ): Promise<Omit<StorageFacts, "gatheredAt">> {
   const host = await probeHost(run);
+  // lsblk/findmnt read fine as an unprivileged user (incl. serial/model); only
+  // the btrfs inspection needs privilege (it opens the raw device nodes).
   const blockDevices = parseLsblk((await run("lsblk -J -O -b")).stdout);
   const mounts = parseFindmnt(
     (await run(
@@ -684,11 +710,11 @@ export async function collectStorage(
   const btrfsMounts = mounts.filter((m) => m.fstype === "btrfs");
   let btrfs: BtrfsFs[] = [];
   if (btrfsMounts.length) {
-    const show = (await run("btrfs filesystem show --raw 2>/dev/null")).stdout;
+    const show = (await run(`${bp}btrfs filesystem show --raw 2>/dev/null`)).stdout;
     const subvolLists: Array<{ mount: string; stdout: string }> = [];
     for (const m of btrfsMounts) {
       const out =
-        (await run(`btrfs subvolume list -o ${m.target} 2>/dev/null`)).stdout;
+        (await run(`${bp}btrfs subvolume list -o ${m.target} 2>/dev/null`)).stdout;
       subvolLists.push({ mount: m.target, stdout: out });
     }
     btrfs = parseBtrfs(show, subvolLists);
@@ -722,16 +748,20 @@ export async function persistFstab(
   session: Session,
   mountpoint: string,
   line: string,
+  bp = "",
 ): Promise<{ replaced: number; backup: string }> {
-  const existing = (await session.run("cat /etc/fstab")).stdout;
+  const existing = (await session.run(`${bp}cat /etc/fstab`)).stdout;
   const { content, replaced } = mergeFstab(existing, mountpoint, line);
   const backup = `/etc/fstab.swamp-bak.${Date.now()}`;
-  const bk = await session.run(`cp -a /etc/fstab ${backup}`);
+  const bk = await session.run(`${bp}cp -a /etc/fstab ${backup}`);
   if (bk.exitCode !== 0) {
     throw new Error(`could not back up /etc/fstab (rc=${bk.exitCode})`);
   }
+  // Decode then `tee` so the privileged write owns the file (a `> /etc/fstab`
+  // redirect happens in the caller's shell, which isn't root under `become`);
+  // pipefail in a subshell so a decode failure isn't masked by tee's success.
   const wr = await session.run(
-    `printf '%s' '${b64encode(content)}' | base64 -d > /etc/fstab`,
+    `( set -o pipefail; printf '%s' '${b64encode(content)}' | base64 -d | ${bp}tee /etc/fstab > /dev/null )`,
   );
   if (wr.exitCode !== 0) {
     throw new Error(`could not write /etc/fstab (rc=${wr.exitCode})`);
@@ -742,7 +772,15 @@ export async function persistFstab(
 export const model = {
   type: "@shrug/serial-cfgmgmt/storage",
   version: "2026.07.22.2",
-  globalArguments: z.object({ ...ConnectionGlobals }),
+  globalArguments: z.object({
+    ...ConnectionGlobals,
+    become: z.boolean().default(false).describe(
+      "Escalate privilege for the btrfs probes and every mutating command (the login user is unprivileged, e.g. a `fedora` serial console with sudo). Leave false when the session is already root.",
+    ),
+    becomeMethod: z.enum(["sudo", "doas"]).default("sudo").describe(
+      "Privilege-escalation command used when `become` is true. `sudo` runs as `sudo -n` (non-interactive).",
+    ),
+  }),
   resources: {
     storage: {
       description:
@@ -777,10 +815,11 @@ export const model = {
       arguments: z.object({}),
       execute: async (_args: Record<string, never>, context: Ctx) => {
         const g = context.globalArgs;
+        const bp = becomeOf(g);
         const facts = await withSession(
           g,
           context.logger,
-          (session) => collectStorage((cmd) => session.run(cmd)),
+          (session) => collectStorage((cmd) => session.run(cmd), bp),
         );
         context.logger.info(
           "disks on {device}: {host} — {devs} block device(s), {mounts} mount(s), {btrfs} btrfs fs",
@@ -851,6 +890,7 @@ export const model = {
         context: Ctx,
       ) => {
         const g = context.globalArgs;
+        const bp = becomeOf(g);
         const fmArgs: FormatMountArgs = {
           device: args.device,
           partition: args.partition,
@@ -866,12 +906,13 @@ export const model = {
           const facts = await withSession(
             g,
             context.logger,
-            (s) => collectStorage((c) => s.run(c)),
+            (s) => collectStorage((c) => s.run(c), bp),
           );
           const dev = findDevice(facts.blockDevices, args.device);
           const plan = planFormatMount(
             { ...facts, gatheredAt: "" },
             fmArgs,
+            bp,
           );
           const record = {
             method: "format_mount",
@@ -930,7 +971,7 @@ export const model = {
         if (args.fstabOptions) assertSafe(args.fstabOptions, SAFE_OPTS_RE, "fstabOptions");
 
         const result = await withSession(g, context.logger, async (session) => {
-          const facts = await collectStorage((c) => session.run(c));
+          const facts = await collectStorage((c) => session.run(c), bp);
           const dev = findDevice(facts.blockDevices, args.device);
           const guard = confirmMatches(dev, args.confirmDevice!, args.device);
           if (!guard.ok) {
@@ -957,17 +998,19 @@ export const model = {
             ? partitionPath(args.device)
             : args.device;
 
+          // `step` privilege-escalates every mutating command with `bp` (they all
+          // need root); mirrors what the dry-run plan previews.
           const step = async (cmd: string) => {
-            const r = await session.run(cmd);
+            const r = await session.run(`${bp}${cmd}`);
             if (r.exitCode !== 0) {
-              throw new Error(`\`${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`);
+              throw new Error(`\`${bp}${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`);
             }
             return r;
           };
           if (args.wipe) await step(`wipefs -a ${args.device}`);
           if (args.partition) {
             await step(`parted -s ${args.device} mklabel gpt mkpart primary 0% 100%`);
-            await session.run("udevadm settle 2>/dev/null; sleep 1");
+            await session.run(`${bp}udevadm settle 2>/dev/null; sleep 1`);
           }
           const mkfs = [`mkfs.${args.fstype}`];
           if (args.label) mkfs.push(`-L ${args.label}`);
@@ -987,7 +1030,7 @@ export const model = {
             fstype: args.fstype,
             options: args.fstabOptions ?? "defaults",
           });
-          const fstab = await persistFstab(session, args.mountpoint, line);
+          const fstab = await persistFstab(session, args.mountpoint, line, bp);
           await step(`mount ${args.mountpoint}`);
           const verify = (await step(`findmnt --real -n ${args.mountpoint}`)).stdout.trim();
 
@@ -1060,6 +1103,7 @@ export const model = {
         context: Ctx,
       ) => {
         const g = context.globalArgs;
+        const bp = becomeOf(g);
         const relArgs: RelocateArgs = {
           sourceSubvol: args.sourceSubvol,
           targetMount: args.targetMount,
@@ -1072,9 +1116,9 @@ export const model = {
           const facts = await withSession(
             g,
             context.logger,
-            (s) => collectStorage((c) => s.run(c)),
+            (s) => collectStorage((c) => s.run(c), bp),
           );
-          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs);
+          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs, bp);
           const targetMount = facts.mounts.find((m) => m.target === args.targetMount);
           const record = {
             method: "relocate_subvol",
@@ -1125,7 +1169,7 @@ export const model = {
           assertSafe(args.finalMountpoint, SAFE_PATH_RE, "finalMountpoint");
         }
         const result = await withSession(g, context.logger, async (session) => {
-          const facts = await collectStorage((c) => session.run(c));
+          const facts = await collectStorage((c) => session.run(c), bp);
           const targetMount = facts.mounts.find((m) => m.target === args.targetMount);
           if (!targetMount || targetMount.fstype !== "btrfs") {
             throw new Error(
@@ -1151,13 +1195,14 @@ export const model = {
             );
           }
 
-          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs);
+          const plan = planRelocateSubvol({ ...facts, gatheredAt: "" }, relArgs, bp);
           const snapPath = plan.snapPath;
           const snapBase = snapPath.slice(snapPath.lastIndexOf("/") + 1);
           const received = `${args.targetMount.replace(/\/+$/, "")}/${snapBase}`;
 
+          // `step` privilege-escalates every command with `bp` (all need root).
           const step = async (cmd: string) => {
-            const r = await session.run(cmd);
+            const r = await session.run(`${bp}${cmd}`);
             if (r.exitCode !== 0) {
               throw new Error(`\`${cmd}\` failed (rc=${r.exitCode}): ${r.stdout.slice(-300)}`);
             }
@@ -1168,11 +1213,14 @@ export const model = {
           // send|receive is a single local pipeline; it can run long with no
           // intermediate output — the session's maxMs bound applies. pipefail so
           // a failing `send` isn't masked by a succeeding `receive`; in a
-          // subshell so the option doesn't leak into later session commands
-          // (e.g. the `find|wc` / `du|cut` verify pipelines below).
-          await step(
-            `( set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount} )`,
-          );
+          // subshell so the option doesn't leak into later session commands. Run
+          // directly (NOT via `step`, which would prefix the subshell as a whole,
+          // i.e. `sudo -n ( … )`) — `bp` goes on each pipeline stage instead.
+          const pipe = `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`;
+          const sr = await session.run(pipe);
+          if (sr.exitCode !== 0) {
+            throw new Error(`\`${pipe}\` failed (rc=${sr.exitCode}): ${sr.stdout.slice(-300)}`);
+          }
 
           // Verify (never trust the exit code alone):
           //  1. the received copy's `Received UUID` links the source snapshot's
@@ -1224,7 +1272,7 @@ export const model = {
               fstype: "btrfs",
               options: `subvol=${subvolFsPath}`,
             });
-            fstab = await persistFstab(session, mp, fstabLine);
+            fstab = await persistFstab(session, mp, fstabLine, bp);
           }
 
           return {
