@@ -1632,7 +1632,7 @@ export const model = {
         "Start a persistent session holder: a detached `socat` opens the port once and bridges it to a PTY, so the logged-in shell survives across separate method runs. Later send/read/exec/login (and serial-cfgmgmt) calls automatically attach to the holder. With capture=true, also spawn a drainer that appends ALL console bytes to an on-disk ring, capturing output emitted while no client is attached (async printk, panic traces); read it with capture_read. Idempotency: errors if one is already live — stop it first with session_stop.",
       arguments: z.object({
         capture: z.boolean().default(false).describe(
-          "Also spawn a drainer that records all console bytes to a ring (read with capture_read).",
+          "Also spawn a drainer that records all console bytes to a ring (read with capture_read). Note: while capturing, exec/login read responses via the ring and reliably return command OUTPUT, but matching the bare shell prompt is best-effort (a no-newline prompt flushes to a serial console only on the next write) — prefer a newline-terminated command-emitted sentinel and generous idleMs. The async/unattended capture path (capture_read) is unaffected.",
         ),
         captureMaxBytes: z.number().int().positive().default(
           DEFAULT_CAPTURE_MAX_BYTES,
