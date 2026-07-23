@@ -15,6 +15,7 @@ models:
   - serial_cfgmgmt_exec.ts
   - serial_cfgmgmt_package.ts
   - serial_cfgmgmt_service.ts
+  - serial_cfgmgmt_file.ts
 
 # Shells out to stty(1)/dd/cat and matches Linux device paths (/dev/ttyUSB* etc),
 # so it targets Linux hosts.
