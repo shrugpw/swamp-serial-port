@@ -243,33 +243,19 @@ export function isPermissionError(e: unknown): boolean {
   );
 }
 
-/** stty(1) line configuration — shared by every transport. */
-async function configureStty(cfg: PortConfig): Promise<void> {
-  const args = [
-    "-F",
-    cfg.device,
-    String(cfg.baud),
-    "raw",
-    "-echo",
-    "clocal",
-    "-crtscts",
-    ...framingArgs(cfg.framing),
-    // VMIN 0 / VTIME N: reads return promptly instead of blocking forever.
-    "min",
-    "0",
-    "time",
-    String(READ_VTIME_DS),
-  ];
+/** Run one stty(1) invocation against `device`, mapping failures to clear
+ *  errors (busy port held elsewhere, missing binary). */
+async function runStty(device: string, settings: string[]): Promise<void> {
   let out;
   try {
     out = await new Deno.Command("stty", {
-      args,
+      args: ["-F", device, ...settings],
       stdout: "piped",
       stderr: "piped",
     }).output();
   } catch (e) {
     throw new Error(
-      `Failed to run stty for ${cfg.device}: ${
+      `Failed to run stty for ${device}: ${
         (e as Error).message
       }. Is stty(1) on PATH?`,
     );
@@ -278,13 +264,53 @@ async function configureStty(cfg: PortConfig): Promise<void> {
     const err = new TextDecoder().decode(out.stderr).trim();
     if (/busy/i.test(err)) {
       throw new Error(
-        `Port ${cfg.device} is busy — held by another process (screen/minicom/another swamp run). Free it first.`,
+        `Port ${device} is busy — held by another process (screen/minicom/another swamp run). Free it first.`,
       );
     }
     throw new Error(
-      `stty failed for ${cfg.device}: ${err || `exit ${out.code}`}`,
+      `stty failed for ${device}: ${err || `exit ${out.code}`}`,
     );
   }
+}
+
+/**
+ * stty(1) line configuration shared by every transport: baud, raw framing,
+ * no echo. VMIN/VTIME are deliberately NOT set here — each transport applies
+ * its own read timing via applyReadMode() right before it opens the port,
+ * because the subprocess `cat` reader and the in-process direct poll loop need
+ * opposite settings. (Note: `raw` alone leaves min 1 / time 0, so any transport
+ * that wants promptly-returning reads must assert it explicitly.)
+ */
+async function configureStty(cfg: PortConfig): Promise<void> {
+  await runStty(cfg.device, [
+    String(cfg.baud),
+    "raw",
+    "-echo",
+    "clocal",
+    "-crtscts",
+    ...framingArgs(cfg.framing),
+  ]);
+}
+
+/**
+ * Read-timing mode, applied per transport after the shared line config:
+ *  - "poll"  (min 0 / time N): read() returns 0 promptly on an idle line, which
+ *    the direct transport's in-process loop relies on to detect quiescence.
+ *  - "block" (min 1 / time 0): read() blocks until ≥1 byte arrives, so the
+ *    long-lived `cat` reader never sees a zero-length read — which it would
+ *    treat as EOF and exit on the first quiet moment, delivering only one
+ *    command's response per session. The subprocess transport detects idle
+ *    host-side (ByteQueue + SUBPROC_READ_POLL_MS), so blocking reads are
+ *    exactly what it wants. This is the fix for the gather-all-unknown bug.
+ */
+async function applyReadMode(
+  device: string,
+  mode: "poll" | "block",
+): Promise<void> {
+  const settings = mode === "block"
+    ? ["min", "1", "time", "0"]
+    : ["min", "0", "time", String(READ_VTIME_DS)];
+  await runStty(device, settings);
 }
 
 /** Direct raw-fd port via Deno.open (needs read+write on the device path). */
@@ -301,6 +327,8 @@ async function openDirect(device: string): Promise<SerialPort> {
     if (isPermissionError(e)) throw e; // let `auto` detect / surface
     throw new Error(`Failed to open ${device}: ${(e as Error).message}`);
   }
+  // The in-process read loop polls, so it needs promptly-returning reads.
+  await applyReadMode(device, "poll");
   return {
     async write(bytes: Uint8Array): Promise<number> {
       let total = 0;
@@ -415,8 +443,15 @@ export class ByteQueue {
  * bytes are never dropped between reads (the fix for dd-per-poll gap loss).
  * Reads drain the queue, waiting up to SUBPROC_READ_POLL_MS for new bytes before
  * reporting idle. Writes are short-lived `dd of=DEV` spawns.
+ *
+ * The port is switched to blocking reads (min 1 / time 0) before `cat` starts:
+ * with the poll setting (min 0 / time N) `cat`'s read() returns 0 on an idle
+ * line, which it treats as EOF and exits — so a multi-command session would get
+ * exactly one response. We assert it here, before the reader opens, so no opener
+ * touches the device path once the reader is live.
  */
-function openSubprocess(device: string): SerialPort {
+async function openSubprocess(device: string): Promise<SerialPort> {
+  await applyReadMode(device, "block");
   const child = new Deno.Command("cat", {
     args: [device],
     stdin: "null",
@@ -506,7 +541,7 @@ export function makeDirectTransport(): Transport {
 export function makeSubprocessTransport(): Transport {
   return {
     configure: configureStty,
-    open: (device: string) => Promise.resolve(openSubprocess(device)),
+    open: (device: string) => openSubprocess(device),
   };
 }
 
@@ -525,7 +560,7 @@ export function makeAutoTransport(
             "Direct Deno.open denied on {device}; falling back to subprocess (dd) I/O",
             { device },
           );
-          return openSubprocess(device);
+          return await openSubprocess(device);
         }
         throw e;
       }
