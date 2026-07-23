@@ -16,6 +16,7 @@ import {
   type Session,
   withSession,
 } from "./serial_cfgmgmt_lib.ts";
+import { deviceAllowlistCheck } from "./serial_port.ts";
 
 const PackageSchema = z.object({
   name: z.string(),
@@ -95,6 +96,10 @@ export const model = {
       garbageCollection: 10,
     },
   },
+  // install is mutating (assumes a privileged shell); fail before opening the
+  // port if the device is not an allowed tty path. query is read-only, unscoped.
+  checks: deviceAllowlistCheck(["install"]),
+
   methods: {
     query: {
       description:

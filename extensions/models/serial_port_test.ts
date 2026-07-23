@@ -13,6 +13,7 @@ import {
   assertAllowedDevice,
   ByteQueue,
   type Clock,
+  deviceAllowlistCheck,
   drainUntil,
   execOn,
   framingArgs,
@@ -145,6 +146,34 @@ Deno.test("assertAllowedDevice — throws on a pty (login password exfil guard)"
   );
 });
 
+// ── deviceAllowlistCheck (pre-flight) ────────────────────────────────────────
+
+Deno.test("deviceAllowlistCheck — labels + appliesTo are wired for skipping", () => {
+  const check = deviceAllowlistCheck(["send", "login"])["device-allowlisted"];
+  assertEquals(check.labels, ["policy"]);
+  assertEquals(check.appliesTo, ["send", "login"]);
+});
+
+Deno.test("deviceAllowlistCheck — passes for an allowed tty path", () => {
+  const check = deviceAllowlistCheck(["send"])["device-allowlisted"];
+  assertEquals(check.execute({ globalArgs: { device: "/dev/ttyUSB0" } }), {
+    pass: true,
+  });
+});
+
+Deno.test("deviceAllowlistCheck — fails a mutating method aimed at a non-tty path", () => {
+  const check = deviceAllowlistCheck(["send"])["device-allowlisted"];
+  const res = check.execute({ globalArgs: { device: "/dev/pts/7" } });
+  assertEquals(res.pass, false);
+  assertMatch(res.errors?.[0] ?? "", /not an allowed serial tty path/);
+});
+
+Deno.test("deviceAllowlistCheck — defers to the in-method guard when device is unset", () => {
+  // At `validate` time globalArgs are unpopulated; the check must not fail then.
+  const check = deviceAllowlistCheck(["send"])["device-allowlisted"];
+  assertEquals(check.execute({ globalArgs: {} }), { pass: true });
+});
+
 // ── mergeConfig precedence ──────────────────────────────────────────────────
 
 Deno.test("mergeConfig — arg > port resource > global", () => {
@@ -234,7 +263,12 @@ Deno.test("selectTransport — each mode yields a configure+open transport", () 
 
 Deno.test("socatDeviceOpts — maps framing to socat serial options", () => {
   const opts = (framing: string, baud = 115200) =>
-    socatDeviceOpts({ device: "/dev/ttyUSB0", baud, framing, lineEnding: "\n" });
+    socatDeviceOpts({
+      device: "/dev/ttyUSB0",
+      baud,
+      framing,
+      lineEnding: "\n",
+    });
   // 8N1: 8 bits, no parity, 1 stop bit; raw, no echo, no flow control, no hangup.
   assertEquals(
     opts("8N1"),
@@ -264,11 +298,17 @@ Deno.test("socatDeviceOpts — rejects malformed framing", () => {
 });
 
 Deno.test("sessionPtyPath — derives a stable, sanitised PTY link path", () => {
-  assertEquals(sessionPtyPath("/dev/ttyUSB0"), "/tmp/swamp-serial-_dev_ttyUSB0.pty");
+  assertEquals(
+    sessionPtyPath("/dev/ttyUSB0"),
+    "/tmp/swamp-serial-_dev_ttyUSB0.pty",
+  );
   // Same device → same path (so separate runs find the same holder).
   assertEquals(sessionPtyPath("/dev/ttyUSB0"), sessionPtyPath("/dev/ttyUSB0"));
   // No shell metacharacters survive sanitisation.
-  assertMatch(sessionPtyPath("/dev/serial/by-id/usb-x.y"), /^\/tmp\/swamp-serial-[\w-]+\.pty$/);
+  assertMatch(
+    sessionPtyPath("/dev/serial/by-id/usb-x.y"),
+    /^\/tmp\/swamp-serial-[\w-]+\.pty$/,
+  );
 });
 
 Deno.test("isPermissionError — detects Deno permission denials", () => {

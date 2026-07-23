@@ -15,6 +15,7 @@ import {
   type Session,
   withSession,
 } from "./serial_cfgmgmt_lib.ts";
+import { deviceAllowlistCheck } from "./serial_port.ts";
 
 const ServiceSchema = z.object({
   name: z.string(),
@@ -109,6 +110,10 @@ export const model = {
       garbageCollection: 10,
     },
   },
+  // start/stop/enable/disable are mutating (assume a privileged shell); fail
+  // before opening the port on a non-tty path. status is read-only, unscoped.
+  checks: deviceAllowlistCheck(["start", "stop", "enable", "disable"]),
+
   methods: {
     status: {
       description:

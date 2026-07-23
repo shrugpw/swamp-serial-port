@@ -213,6 +213,56 @@ export function assertAllowedDevice(device: string): void {
   }
 }
 
+/** The result a pre-flight check returns to the engine. */
+export interface CheckResult {
+  pass: boolean;
+  errors?: string[];
+}
+
+/**
+ * A labeled pre-flight `checks` record that fails a mutating method BEFORE any
+ * port is opened unless the configured device is an allowed serial tty path.
+ * The in-method `assertAllowedDevice` is the last line of defense; this surfaces
+ * the same invariant up front (skippable via `--skip-check-label policy`) so a
+ * mutation can never begin against an arbitrary terminal. `appliesTo` scopes it
+ * to the given mutating method names.
+ */
+export function deviceAllowlistCheck(
+  appliesTo: string[],
+): Record<string, {
+  description: string;
+  labels: string[];
+  appliesTo: string[];
+  execute: (context: { globalArgs: { device?: string } }) => CheckResult;
+}> {
+  return {
+    "device-allowlisted": {
+      description:
+        "The configured serial device is an allowed tty path — fail before a " +
+        "mutating method opens an arbitrary terminal.",
+      labels: ["policy"],
+      appliesTo,
+      execute: (context) => {
+        const device = context.globalArgs.device;
+        // `device` is a required string at method-run time, but globalArgs are
+        // unpopulated when the engine smoke-runs checks during `validate`.
+        // Defer to the in-method `assertAllowedDevice` hard guard when unset;
+        // only fail here when a concrete, disallowed path is present.
+        if (typeof device !== "string" || isAllowedDevice(device)) {
+          return { pass: true };
+        }
+        return {
+          pass: false,
+          errors: [
+            `Device "${device}" is not an allowed serial tty path ` +
+            `(/dev/ttyUSB*, /dev/ttyACM*, /dev/ttyS*, /dev/serial/*).`,
+          ],
+        };
+      },
+    },
+  };
+}
+
 // ── Transport seam ──────────────────────────────────────────────────────────
 
 /** An open serial port. read() returns bytes read, or null on no-data/EOF. */
@@ -1101,6 +1151,10 @@ export const model = {
       garbageCollection: 10,
     },
   },
+  // Fail fast (before any port open) if a console-writing method is aimed at a
+  // non-tty path — the mutating surface can never touch an arbitrary terminal.
+  checks: deviceAllowlistCheck(["send", "exec", "login"]),
+
   methods: {
     establish: {
       description:
