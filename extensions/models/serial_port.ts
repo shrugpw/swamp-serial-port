@@ -1196,12 +1196,15 @@ function transportFor(context: MethodContext): Transport {
 }
 
 /**
- * Bound the ring: if the total stream length has crossed `captureMaxBytes`,
- * rotate (current → `.1`, discard old `.1`, fresh current + fresh drainer) and
- * return the updated thresholds + new drainer pid. Returns null when no rotation
- * is due. Called only from `capture_read`, a serial-port-model operation holding
- * the model lock — so it never overlaps an in-flight `exec`/`read` (the drainer
- * itself never self-rotates; that is what makes this the serialisation point).
+ * Bound the ring: if the CURRENT file has crossed `captureMaxBytes` (via
+ * {@link shouldRotate} — NOT the monotonic total stream length, which only grows
+ * and would re-rotate on every read), rotate (current → `.1`, discard old `.1`,
+ * fresh current + fresh drainer) and return the updated thresholds + new drainer
+ * pid (which is null, with `drainerAlive: false`, when the restart failed).
+ * Returns null when no rotation is due. Called only from `capture_read`, a
+ * serial-port-model operation holding the model lock — so it never overlaps an
+ * in-flight `exec`/`read` (the drainer never self-rotates; that is what makes
+ * this the serialisation point).
  */
 async function maybeRotate(
   session: SessionResource,
@@ -1555,34 +1558,41 @@ export const model = {
         // secret would persist plaintext in the ring. Note the ring end BEFORE
         // login so we can redact the login span afterwards (CAP-2).
         const redactFrom = capturing && ringPath ? await fileSize(ringPath) : 0;
-        const result = await withPort(
-          transportFor(context),
-          ioCfg,
-          async (port) => {
-            const rport = capturing && ringPath
-              ? await ringReadPort(port, ringPath)
-              : port;
-            if (attached && !capturing) await drainStaleOnAttach(port);
-            return loginOn(rport, {
-              username,
-              password,
-              lineEnding: cfg.lineEnding,
-              promptAfter: toRegex(args.promptAfter),
-              idleMs: args.idleMs,
-              maxMs: args.maxMs,
-            });
-          },
-        );
-        // Offset-preserving in-place redaction of the credential from the ring
-        // (serialised on the model lock — no concurrent reader). Belt-and-braces
-        // with the getty's echo-off; the transcript is already scrubbed.
-        if (capturing && ringPath) {
-          const n = await redactSecretInRing(ringPath, redactFrom, password);
-          if (n > 0) {
-            context.logger.info(
-              "Redacted {n} credential occurrence(s) from the capture ring on {device}",
-              { n, device: cfg.device },
-            );
+        let result;
+        try {
+          result = await withPort(
+            transportFor(context),
+            ioCfg,
+            async (port) => {
+              const rport = capturing && ringPath
+                ? await ringReadPort(port, ringPath)
+                : port;
+              if (attached && !capturing) await drainStaleOnAttach(port);
+              return loginOn(rport, {
+                username,
+                password,
+                lineEnding: cfg.lineEnding,
+                promptAfter: toRegex(args.promptAfter),
+                idleMs: args.idleMs,
+                maxMs: args.maxMs,
+              });
+            },
+          );
+        } finally {
+          // Offset-preserving in-place redaction of the credential from the ring
+          // (serialised on the model lock — no concurrent reader). In a `finally`
+          // so it still runs when loginOn throws AFTER the password was sent
+          // (e.g. a mid-response write stall) — otherwise the echoed password
+          // would persist in the ring. Belt-and-braces with the getty's echo-off;
+          // the transcript is already scrubbed. redactSecretInRing never throws.
+          if (capturing && ringPath) {
+            const n = await redactSecretInRing(ringPath, redactFrom, password);
+            if (n > 0) {
+              context.logger.info(
+                "Redacted {n} credential occurrence(s) from the capture ring on {device}",
+                { n, device: cfg.device },
+              );
+            }
           }
         }
         context.logger.info("login on {device} as {user}: {status}", {

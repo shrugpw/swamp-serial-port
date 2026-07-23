@@ -21,7 +21,7 @@
  * ## What is pure vs live
  *
  * The offset/eviction/rotation arithmetic ({@link computeReadPlan},
- * {@link planRotation}, {@link retainedStart}, {@link captureBytes}) is pure over
+ * {@link shouldRotate}, {@link retainedStart}, {@link captureBytes}) is pure over
  * the two-file (`.1` + current) window and is unit-tested with fixture files —
  * no hardware, no socat, no drainer. The drainer + socat spawn and the ring reads
  * touch the OS through subprocesses (like the device transport), so they are
@@ -420,8 +420,12 @@ export async function rotateRing(
   await stopDrainer(oldDrainerPid);
   const finalSize = await fileSize(ringPath); // stable: drainer is stopped
   const th = rotationThresholds(captureBase, finalSize);
+  // `umask 077` so the freshly-recreated current file is 0600 from creation —
+  // startDrainer re-chmods it too, but this closes the window before that runs
+  // (the ring may land in world-traversable /tmp). `.1` keeps current's bits
+  // through the `mv`.
   await sh(
-    `rm -f ${shq(prev)}; mv -f ${shq(ringPath)} ${shq(prev)}; : > ${
+    `umask 077; rm -f ${shq(prev)}; mv -f ${shq(ringPath)} ${shq(prev)}; : > ${
       shq(ringPath)
     }`,
   );
@@ -508,6 +512,14 @@ async function writeFileBytesAt(
         `seek=${offset}`,
         "count=1",
         "conv=notrunc",
+        // `iflag=fullblock` is LOAD-BEARING: dd reads its (piped) stdin one
+        // read() at a time, and a pipe read returns as soon as any bytes are
+        // available (often ≤64 KiB). Without fullblock, `count=1` would treat
+        // that first short read as the whole block, write only a prefix, and
+        // still exit 0 — silently leaving the rest of a large redaction tail
+        // (i.e. plaintext password bytes past the boundary) unwritten. fullblock
+        // makes dd accumulate the full `bs` from stdin before writing.
+        "iflag=fullblock",
         "oflag=seek_bytes",
       ],
       stdin: "piped",

@@ -467,6 +467,32 @@ Deno.test("redactSecretInRing overwrites the secret in place, preserving offsets
   }
 });
 
+Deno.test("redactSecretInRing redacts a secret past the pipe-buffer boundary in a large tail (NEW-1)", async () => {
+  // The write-back dd pipes the whole tail through stdin; without iflag=fullblock
+  // a >64 KiB tail would truncate and leave the trailing secret in plaintext.
+  const ring = await Deno.makeTempFile();
+  try {
+    const filler = new Uint8Array(300_000).fill(0x2e); // '.', well past 64 KiB
+    const secret = new TextEncoder().encode("s3cr3t-tail-pw");
+    const trailer = new TextEncoder().encode("\n[fedora@host ~]$ ");
+    // Secret sits ~300 KB into the tail, past any single pipe read.
+    await Deno.writeFile(ring, concatBytes([filler, secret, trailer]));
+    const sizeBefore = await fileSize(ring);
+    const n = await redactSecretInRing(ring, 0, "s3cr3t-tail-pw");
+    assertEquals(n, 1);
+    assertEquals(await fileSize(ring), sizeBefore); // offset-preserving
+    // Read the WHOLE file back and confirm the secret is gone on DISK, not just
+    // in the first pipe-read's worth of bytes.
+    const whole = await readFileBytes(ring, 0, sizeBefore);
+    assertEquals(indexOfBytes(whole, secret), -1); // truly overwritten
+    // The equal-length redaction landed at the right place.
+    const stars = new Uint8Array(secret.length).fill(0x2a);
+    assertEquals(indexOfBytes(whole, stars) >= 0, true);
+  } finally {
+    await Deno.remove(ring);
+  }
+});
+
 Deno.test("redactSecretInRing is a no-op for an absent or empty secret", async () => {
   const ring = await Deno.makeTempFile();
   try {
