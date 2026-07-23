@@ -11,7 +11,12 @@
  *
  * @module
  */
-import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertThrows,
+} from "jsr:@std/assert@1";
 import { type CommandResult, type Session } from "./serial_cfgmgmt_lib.ts";
 import {
   appendChunkCmd,
@@ -21,13 +26,17 @@ import {
   fromBase64,
   gunzipBytes,
   gzipBytes,
+  moveCmd,
   pullViaSession,
   pushViaSession,
   resourceKey,
   sha256Hex,
   shq,
+  stagingCreateCmd,
   stagingPathFor,
+  tempDestFor,
   toBase64,
+  truncateCmd,
   verifyViaSession,
 } from "./serial_cfgmgmt_file.ts";
 
@@ -45,7 +54,10 @@ Deno.test("base64 round-trips arbitrary bytes including control chars", () => {
 Deno.test("fromBase64 ignores whitespace / CR / line wraps", () => {
   const b64 = toBase64(enc("hello world, this is a config line"));
   const wrapped = b64.replace(/(.{4})/g, "$1\n"); // inject newlines every 4 chars
-  assertEquals(dec(fromBase64(wrapped + "\r\n  ")), "hello world, this is a config line");
+  assertEquals(
+    dec(fromBase64(wrapped + "\r\n  ")),
+    "hello world, this is a config line",
+  );
 });
 
 Deno.test("chunkBase64 splits at the line ceiling, last chunk short", () => {
@@ -55,7 +67,9 @@ Deno.test("chunkBase64 splits at the line ceiling, last chunk short", () => {
 });
 
 Deno.test("gzip/gunzip round-trips (and gunzip reads our own gzip)", async () => {
-  const data = enc("configuration=true\nrepeat repeat repeat repeat\n".repeat(20));
+  const data = enc(
+    "configuration=true\nrepeat repeat repeat repeat\n".repeat(20),
+  );
   const gz = await gzipBytes(data);
   assert(gz.length < data.length, "should compress repetitive text");
   assertEquals(await gunzipBytes(gz), data);
@@ -76,12 +90,18 @@ Deno.test("extractBetweenMarkers ignores the echoed command line containing the 
     "SGVsbG8=",
     "__SWAMP_XFER_END__",
   ].join("\n");
-  assertEquals(extractBetweenMarkers(text, "__SWAMP_XFER_BEGIN__", "__SWAMP_XFER_END__"), "SGVsbG8=");
+  assertEquals(
+    extractBetweenMarkers(text, "__SWAMP_XFER_BEGIN__", "__SWAMP_XFER_END__"),
+    "SGVsbG8=",
+  );
 });
 
 Deno.test("shq neutralizes embedded single quotes", () => {
   assertEquals(shq("/tmp/a'b"), "'/tmp/a'\\''b'");
-  assertEquals(appendChunkCmd("/tmp/s.b64", "QUJD"), "printf '%s\\n' 'QUJD' >> '/tmp/s.b64'");
+  assertEquals(
+    appendChunkCmd("/tmp/s.b64", "QUJD"),
+    "printf '%s\\n' 'QUJD' >> '/tmp/s.b64'",
+  );
 });
 
 Deno.test("stagingPathFor is content-derived and .b64", () => {
@@ -133,6 +153,23 @@ function fakeTarget(opts: {
 
       let m: RegExpMatchArray | null;
 
+      // Exclusive staging create: rm -f 'X' && (set -C; : > 'X')
+      if (
+        (m = command.match(
+          /^rm -f '([^']+)' && \(set -C; : > '([^']+)'\)$/,
+        ))
+      ) {
+        staging.set(m[2], "");
+        return ok();
+      }
+
+      // truncate -s N 'X' — roll staging back to N bytes
+      if ((m = command.match(/^truncate -s (\d+) '([^']+)'/))) {
+        const n = Number(m[1]);
+        staging.set(m[2], (staging.get(m[2]) ?? "").slice(0, n));
+        return ok();
+      }
+
       if ((m = command.match(/^rm -f '([^']+)'$/))) {
         staging.delete(m[1]);
         fs.delete(m[1]);
@@ -149,6 +186,7 @@ function fakeTarget(opts: {
         return ok();
       }
 
+      // Decode staging into a TEMP dest (never the live path directly).
       if (
         (m = command.match(
           /base64 -d '([^']+)'(?: \| gzip -d)? > '([^']+)'/,
@@ -163,6 +201,15 @@ function fakeTarget(opts: {
         return ok();
       }
 
+      // Atomic swap: mv -f 'temp' 'remote'
+      if ((m = command.match(/^mv -f '([^']+)' '([^']+)'$/))) {
+        const src = fs.get(m[1]);
+        if (src === undefined) return { stdout: "", exitCode: 1 };
+        fs.set(m[2], src);
+        fs.delete(m[1]);
+        return ok();
+      }
+
       if ((m = command.match(/^sha256sum '([^']+)'/))) {
         const f = fs.get(m[1]);
         if (!f) return { stdout: "", exitCode: 1 };
@@ -172,12 +219,17 @@ function fakeTarget(opts: {
       if ((m = command.match(/^chmod '([^']+)' '([^']+)'/))) return ok();
       if ((m = command.match(/^chown '([^']+)' '([^']+)'/))) return ok();
 
+      // pull existence probe: test -e 'X' && echo __SWAMP_EXISTS__
+      if ((m = command.match(/^test -e '([^']+)' && echo __SWAMP_EXISTS__$/))) {
+        return ok(fs.has(m[1]) ? "__SWAMP_EXISTS__" : "");
+      }
+
       // pull: printf BEGIN; [gzip -c f |] base64 f; printf END
       if (command.includes("__SWAMP_XFER_BEGIN__")) {
         const pm = command.match(/(?:gzip -c|base64) '([^']+)'/);
         const path = pm?.[1] ?? "";
         const f = fs.get(path);
-        if (!f) {
+        if (f === undefined || f.length === 0) {
           return ok("__SWAMP_XFER_BEGIN__\n\n__SWAMP_XFER_END__");
         }
         const payload = command.includes("gzip -c") ? await gzipBytes(f) : f;
@@ -190,7 +242,12 @@ function fakeTarget(opts: {
   };
 }
 
-async function preparePush(session: Session, data: Uint8Array, gzip: boolean, extra: Partial<Parameters<typeof pushViaSession>[1]> = {}) {
+async function preparePush(
+  session: Session,
+  data: Uint8Array,
+  gzip: boolean,
+  extra: Partial<Parameters<typeof pushViaSession>[1]> = {},
+) {
   const localSha = await sha256Hex(data);
   const payload = gzip ? await gzipBytes(data) : data;
   const chunks = chunkBase64(toBase64(payload), 768);
@@ -226,21 +283,49 @@ Deno.test("push retries a transiently-failing chunk then succeeds", async () => 
   assertEquals(dec(t.fs.get("/etc/app.conf")!), "A".repeat(2000));
 });
 
-Deno.test("push fails loudly and LEAVES staging on sha256 mismatch", async () => {
-  const data = enc("important config");
-  const t = fakeTarget({ tamperFinalize: (b) => new Uint8Array([...b, 33]) }); // flip content
+Deno.test("push fails on mismatch, LEAVES staging, and leaves the live target UNTOUCHED (FT-1)", async () => {
+  const original = enc("ORIGINAL fstab — must survive a botched push\n");
+  const data = enc("new content");
+  const t = fakeTarget({
+    seed: { "/etc/app.conf": original }, // a precious pre-existing target
+    tamperFinalize: (b) => new Uint8Array([...b, 33]), // garble the decode
+  });
   await assertRejects(
     () => preparePush(t, data, true),
     Error,
     "sha256 mismatch",
   );
-  // staging file must remain for diagnosis (never rm'd after the failure)
+  // The live target must be byte-for-byte what it was — never truncated/clobbered.
+  assertEquals(dec(t.fs.get("/etc/app.conf")!), dec(original));
+  // staging left for diagnosis; a decode temp was created but never moved into place
   assertEquals(t.staging.size, 1);
+  assert(
+    [...t.fs.keys()].some((k) => k.endsWith(".tmp")),
+    "temp left for diagnosis",
+  );
+});
+
+Deno.test("push applies mode/owner to the temp and only then moves into place", async () => {
+  const data = enc("cfg=1\n");
+  const t = fakeTarget();
+  const res = await preparePush(t, data, true, {
+    mode: "0640",
+    owner: "root:root",
+  });
+  assertEquals(res.verified, true);
+  // chmod/chown must target the .tmp (pre-rename), not the final path
+  assert(t.calls.some((c) => /^chmod '0640' '.*\.tmp'$/.test(c)));
+  assert(t.calls.some((c) => /^chown 'root:root' '.*\.tmp'$/.test(c)));
+  // and the mv happens after both
+  const iChmod = t.calls.findIndex((c) => c.startsWith("chmod"));
+  const iMv = t.calls.findIndex((c) => c.startsWith("mv -f"));
+  assert(iMv > iChmod);
+  assertEquals(dec(t.fs.get("/etc/app.conf")!), "cfg=1\n");
 });
 
 Deno.test("push fails after exhausting retries on a persistently-failing chunk", async () => {
-  const data = enc("x".repeat(1500));
-  // corruptChunk with seen-once only fails once; simulate persistent failure via a session that always fails the append.
+  // Simulate a persistently-failing append via a session that always fails the
+  // `printf ... >>` and succeeds everything else (create/truncate/etc).
   const alwaysFail: Session = {
     run: (command: string) =>
       Promise.resolve(
@@ -279,7 +364,10 @@ Deno.test("push restores console level even when the transfer throws", async () 
 Deno.test("pull round-trips a gzip'd remote file, sha256 verified", async () => {
   const original = enc("log line 1\nlog line 2\n");
   const t = fakeTarget({ seed: { "/var/log/app.log": original } });
-  const res = await pullViaSession(t, { remotePath: "/var/log/app.log", gzip: true });
+  const res = await pullViaSession(t, {
+    remotePath: "/var/log/app.log",
+    gzip: true,
+  });
   assertEquals(res.match, true);
   assertEquals(dec(res.bytes), "log line 1\nlog line 2\n");
 });
@@ -292,13 +380,45 @@ Deno.test("pull works without gzip too", async () => {
   assertEquals(res.match, true);
 });
 
-Deno.test("pull throws on a missing/empty remote file", async () => {
+Deno.test("pull throws 'no such file' on a genuinely missing file", async () => {
   const t = fakeTarget();
   await assertRejects(
-    () => pullViaSession(t, { remotePath: "/nope", gzip: true }),
+    () => pullViaSession(t, { remotePath: "/nope", gzip: true, maxRetries: 0 }),
     Error,
-    "no data",
+    "no such file",
   );
+});
+
+Deno.test("pull round-trips a legitimately EMPTY file (FT-4)", async () => {
+  const t = fakeTarget({ seed: { "/etc/empty": new Uint8Array(0) } });
+  const res = await pullViaSession(t, { remotePath: "/etc/empty", gzip: true });
+  assertEquals(res.bytes.length, 0);
+  assertEquals(res.match, true);
+});
+
+Deno.test("pull retries a printk-corrupted stream, then succeeds (FT-2)", async () => {
+  const original = enc("clean payload\n");
+  const t = fakeTarget({ seed: { "/f": original } });
+  // Wrap run() to inject a garbage byte into the first pull's base64 stream only.
+  const realRun = t.run.bind(t);
+  let corrupted = false;
+  t.run = (command: string) => {
+    if (command.includes("__SWAMP_XFER_BEGIN__") && !corrupted) {
+      corrupted = true;
+      // valid-looking but wrong base64 between the markers → gunzip/sha fails
+      return Promise.resolve(
+        ok("__SWAMP_XFER_BEGIN__\nAAAA\n__SWAMP_XFER_END__"),
+      );
+    }
+    return realRun(command);
+  };
+  const res = await pullViaSession(t, {
+    remotePath: "/f",
+    gzip: true,
+    maxRetries: 3,
+  });
+  assertEquals(dec(res.bytes), "clean payload\n");
+  assert(corrupted, "first attempt was corrupted");
 });
 
 // ── verify ───────────────────────────────────────────────────────────────────
@@ -311,28 +431,72 @@ Deno.test("verify reports match / mismatch without transferring", async () => {
     match: true,
     remoteSha: localSha,
   });
-  const bad = await verifyViaSession(t, { localSha: "00", remotePath: "/etc/x" });
+  const bad = await verifyViaSession(t, {
+    localSha: "00",
+    remotePath: "/etc/x",
+  });
   assertEquals(bad.match, false);
   assertEquals(bad.remoteSha, localSha);
 });
 
 Deno.test("verify reports no match when remote file is absent", async () => {
   const t = fakeTarget();
-  assertEquals(await verifyViaSession(t, { localSha: "ab", remotePath: "/gone" }), {
-    match: false,
-    remoteSha: null,
-  });
+  assertEquals(
+    await verifyViaSession(t, { localSha: "ab", remotePath: "/gone" }),
+    {
+      match: false,
+      remoteSha: null,
+    },
+  );
 });
 
 // ── command builders ─────────────────────────────────────────────────────────
 
-Deno.test("finalizeCmd is gzip-aware and pipefail-guarded", () => {
+Deno.test("finalizeCmd decodes into a temp dest, gzip-aware and pipefail-guarded", () => {
   assertEquals(
-    finalizeCmd("/tmp/s.b64", "/etc/app.conf", true),
-    "set -o pipefail 2>/dev/null; base64 -d '/tmp/s.b64' | gzip -d > '/etc/app.conf'",
+    finalizeCmd("/tmp/s.b64", "/etc/app.conf.tmp", true),
+    "set -o pipefail 2>/dev/null; base64 -d '/tmp/s.b64' | gzip -d > '/etc/app.conf.tmp'",
   );
   assertEquals(
-    finalizeCmd("/tmp/s.b64", "/etc/app.conf", false),
-    "set -o pipefail 2>/dev/null; base64 -d '/tmp/s.b64' > '/etc/app.conf'",
+    finalizeCmd("/tmp/s.b64", "/etc/app.conf.tmp", false),
+    "set -o pipefail 2>/dev/null; base64 -d '/tmp/s.b64' > '/etc/app.conf.tmp'",
+  );
+});
+
+Deno.test("tempDestFor is a same-directory sibling of the target (atomic mv)", () => {
+  const tmp = tempDestFor("/etc/app.conf", "abcdef0123456789");
+  assertEquals(tmp, "/etc/app.conf.swampxfer-abcdef012345.tmp");
+  // sibling ⇒ same filesystem ⇒ mv is atomic
+  assert(tmp.startsWith("/etc/"));
+});
+
+Deno.test("stagingCreateCmd removes then exclusively (set -C) creates", () => {
+  assertEquals(
+    stagingCreateCmd("/tmp/s.b64"),
+    "rm -f '/tmp/s.b64' && (set -C; : > '/tmp/s.b64')",
+  );
+});
+
+Deno.test("truncateCmd rolls staging back to a byte length", () => {
+  assertEquals(
+    truncateCmd("/tmp/s.b64", 42),
+    "truncate -s 42 '/tmp/s.b64' 2>/dev/null",
+  );
+});
+
+Deno.test("moveCmd is a forced same-fs rename", () => {
+  assertEquals(moveCmd("/etc/x.tmp", "/etc/x"), "mv -f '/etc/x.tmp' '/etc/x'");
+});
+
+Deno.test("appendChunkCmd rejects a non-base64 chunk (SEC-3 injection guard)", () => {
+  assertThrows(
+    () => appendChunkCmd("/tmp/s.b64", "x'; rm -rf / ;'"),
+    Error,
+    "not pure base64",
+  );
+  // a real base64 line is accepted
+  assertEquals(
+    appendChunkCmd("/tmp/s.b64", "QUJDPT0="),
+    "printf '%s\\n' 'QUJDPT0=' >> '/tmp/s.b64'",
   );
 });
