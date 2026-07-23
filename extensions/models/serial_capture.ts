@@ -545,18 +545,34 @@ async function writeFileBytesAt(
  * this is called after such a login (which serialises on the model lock, so no
  * concurrent reader), bounded to the login span. Post-login appends past EOF are
  * untouched. Same substring-match limitation as the transcript `scrubSecret`.
- * Returns the number of occurrences redacted.
+ */
+export interface RedactionResult {
+  /** Occurrences of the secret found (and starred in the in-memory tail). */
+  found: number;
+  /**
+   * True when no write was needed OR the in-place write-back succeeded. False
+   * means occurrences were found but the disk write failed — the caller must
+   * NOT report success, since the plaintext secret may remain in the ring.
+   */
+  ok: boolean;
+}
+
+/**
+ * Redact every occurrence of `secret` in the ring's tail `[fromOffset, EOF)`.
+ * Reports whether the write actually landed — a failed write is surfaced (not
+ * swallowed) so `login` cannot log a false "redacted" for a credential still on
+ * disk.
  */
 export async function redactSecretInRing(
   ringPath: string,
   fromOffset: number,
   secret: string,
-): Promise<number> {
-  if (!secret) return 0;
+): Promise<RedactionResult> {
+  if (!secret) return { found: 0, ok: true };
   const sec = new TextEncoder().encode(secret);
-  if (sec.length === 0) return 0;
+  if (sec.length === 0) return { found: 0, ok: true };
   const size = await fileSize(ringPath);
-  if (size <= fromOffset) return 0;
+  if (size <= fromOffset) return { found: 0, ok: true };
   const tail = await readFileBytes(ringPath, fromOffset, size - fromOffset);
   let count = 0;
   let idx = indexOfBytes(tail, sec, 0);
@@ -565,6 +581,7 @@ export async function redactSecretInRing(
     count++;
     idx = indexOfBytes(tail, sec, idx + sec.length);
   }
-  if (count > 0) await writeFileBytesAt(ringPath, fromOffset, tail);
-  return count;
+  if (count === 0) return { found: 0, ok: true };
+  const ok = await writeFileBytesAt(ringPath, fromOffset, tail);
+  return { found: count, ok };
 }

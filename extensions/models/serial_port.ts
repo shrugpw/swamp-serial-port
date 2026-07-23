@@ -1586,11 +1586,18 @@ export const model = {
           // would persist in the ring. Belt-and-braces with the getty's echo-off;
           // the transcript is already scrubbed. redactSecretInRing never throws.
           if (capturing && ringPath) {
-            const n = await redactSecretInRing(ringPath, redactFrom, password);
-            if (n > 0) {
+            const r = await redactSecretInRing(ringPath, redactFrom, password);
+            if (r.found > 0 && r.ok) {
               context.logger.info(
                 "Redacted {n} credential occurrence(s) from the capture ring on {device}",
-                { n, device: cfg.device },
+                { n: r.found, device: cfg.device },
+              );
+            } else if (r.found > 0 && !r.ok) {
+              // Honest failure: the write did not land, so the plaintext may
+              // remain. Do NOT claim success. session_stop clears the ring.
+              context.logger.info(
+                "WARNING: credential redaction WRITE FAILED on the capture ring for {device} — the password may remain in the ring; run session_stop (without keepCapture) to clear it",
+                { device: cfg.device },
               );
             }
           }

@@ -455,8 +455,9 @@ Deno.test("redactSecretInRing overwrites the secret in place, preserving offsets
     );
     await Deno.writeFile(ring, concatBytes([pre, login]));
     const sizeBefore = await fileSize(ring);
-    const n = await redactSecretInRing(ring, pre.length, "hunter2");
-    assertEquals(n, 1);
+    const r = await redactSecretInRing(ring, pre.length, "hunter2");
+    assertEquals(r.found, 1);
+    assertEquals(r.ok, true);
     assertEquals(await fileSize(ring), sizeBefore); // offset-preserving
     const text = new TextDecoder().decode(await readFileBytes(ring, 0, sizeBefore));
     assertEquals(text.includes("hunter2"), false); // secret gone
@@ -478,8 +479,9 @@ Deno.test("redactSecretInRing redacts a secret past the pipe-buffer boundary in 
     // Secret sits ~300 KB into the tail, past any single pipe read.
     await Deno.writeFile(ring, concatBytes([filler, secret, trailer]));
     const sizeBefore = await fileSize(ring);
-    const n = await redactSecretInRing(ring, 0, "s3cr3t-tail-pw");
-    assertEquals(n, 1);
+    const r = await redactSecretInRing(ring, 0, "s3cr3t-tail-pw");
+    assertEquals(r.found, 1);
+    assertEquals(r.ok, true);
     assertEquals(await fileSize(ring), sizeBefore); // offset-preserving
     // Read the WHOLE file back and confirm the secret is gone on DISK, not just
     // in the first pipe-read's worth of bytes.
@@ -497,8 +499,8 @@ Deno.test("redactSecretInRing is a no-op for an absent or empty secret", async (
   const ring = await Deno.makeTempFile();
   try {
     await Deno.writeFile(ring, new TextEncoder().encode("no secrets here\n"));
-    assertEquals(await redactSecretInRing(ring, 0, "absent"), 0);
-    assertEquals(await redactSecretInRing(ring, 0, ""), 0);
+    assertEquals(await redactSecretInRing(ring, 0, "absent"), { found: 0, ok: true });
+    assertEquals(await redactSecretInRing(ring, 0, ""), { found: 0, ok: true });
   } finally {
     await Deno.remove(ring);
   }
