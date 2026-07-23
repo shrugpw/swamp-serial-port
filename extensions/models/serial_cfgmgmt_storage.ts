@@ -127,14 +127,58 @@ const MountResultSchema = z.object({
   details: z.record(z.string(), z.unknown()),
 });
 
-/** Expected identity of a target device, asserted before any live write. */
-const ConfirmDeviceSchema = z.object({
+/**
+ * Expected identity of a target device, asserted before any live write. Must
+ * carry at least one identifying field — an empty `{}` would confirm nothing, so
+ * it is rejected rather than silently letting a live write through unverified.
+ */
+export const ConfirmDeviceSchema = z.object({
   serial: z.string().optional(),
   model: z.string().optional(),
   sizeBytes: z.number().optional(),
   empty: z.boolean().optional(),
+}).refine((o) => Object.values(o).some((v) => v !== undefined), {
+  message:
+    "confirmDevice must assert at least one of serial/model/sizeBytes/empty — " +
+    "an empty object confirms nothing and would defeat verify-before-destroy.",
 });
 export type ConfirmDevice = z.infer<typeof ConfirmDeviceSchema>;
+
+/**
+ * Shell-safety guards for values interpolated into commands run as root on the
+ * target. A plain path/label has no shell metacharacters or whitespace; mount
+ * options / mkfs args allow a slightly wider set but still no shell control
+ * characters. These are enforced both at the zod schema layer (early, friendly
+ * error) and again in-method as a hard backstop.
+ */
+export const SAFE_PATH_RE = /^[A-Za-z0-9._@:+/=-]+$/;
+export const SAFE_LABEL_RE = /^[A-Za-z0-9._-]+$/;
+/** Options / mkfs-args: adds space and comma; still no `;|&$<>()\`"'\\` etc. */
+export const SAFE_OPTS_RE = /^[A-Za-z0-9._@:+/=, -]*$/;
+
+/** Throw unless `value` matches `re`; used as an in-method backstop. */
+export function assertSafe(value: string, re: RegExp, kind: string): void {
+  if (!re.test(value)) {
+    throw new Error(
+      `refusing ${kind} "${value}": contains characters that are not allowed ` +
+        `in a value interpolated into a root shell command (shell metacharacters ` +
+        `or whitespace). This guards against command injection.`,
+    );
+  }
+}
+
+/** Find the top-level disk whose subtree contains `path` (or IS `path`). */
+export function findDiskFor(
+  devices: BlockDevice[],
+  path: string,
+): BlockDevice | null {
+  // Strip a findmnt `[/subvol]` suffix, e.g. /dev/mmcblk1p1[/var] → /dev/mmcblk1p1.
+  const clean = path.replace(/\[.*$/, "");
+  for (const disk of devices) {
+    if (findDevice([disk], clean)) return disk;
+  }
+  return null;
+}
 
 // ————————————————————————————————————————————————————————————————
 // Pure parsers — fixture-testable, no port
@@ -274,33 +318,43 @@ export function parseBtrfs(
   return fss;
 }
 
-/** Pull the first well-formed top-level JSON object out of noisy console text. */
+/**
+ * Pull the first well-formed top-level JSON object out of noisy console text.
+ * Scans for the matching closing brace so trailing prompt/printk noise after the
+ * JSON can't defeat the parse; and if a `{` turns out to start non-JSON (e.g. a
+ * stray brace in a prompt/printk line before the real payload), advances to the
+ * next `{` and retries rather than giving up.
+ */
 function extractJson(raw: string): Record<string, unknown> | null {
-  const start = raw.indexOf("{");
-  if (start < 0) return null;
-  // Scan for the matching closing brace so trailing prompt/printk noise after
-  // the JSON can't defeat the parse.
-  let depth = 0, inStr = false, esc = false;
-  for (let i = start; i < raw.length; i++) {
-    const ch = raw[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === "\\") esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(raw.slice(start, i + 1)) as Record<string, unknown>;
-        } catch {
-          return null;
+  let from = raw.indexOf("{");
+  while (from >= 0) {
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = from; i < raw.length; i++) {
+      const ch = raw[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
         }
       }
     }
+    if (end >= 0) {
+      try {
+        return JSON.parse(raw.slice(from, end + 1)) as Record<string, unknown>;
+      } catch {
+        // This brace group wasn't valid JSON — try the next `{`.
+      }
+    }
+    from = raw.indexOf("{", from + 1);
   }
   return null;
 }
@@ -333,23 +387,19 @@ export function isEmpty(dev: BlockDevice): boolean {
 }
 
 /**
- * Assert a live target device matches the caller's `confirmDevice`. Compares
- * only the fields the caller supplied (stable serial/model/size), plus an
- * always-on refusal to touch a mounted device. Returns every failing reason so
- * the caller can surface exactly why the write was refused.
+ * Identity-only comparison of a live device against `confirmDevice` (stable
+ * serial/model/size, and optional emptiness). Returns every failing reason. Does
+ * NOT include the mounted-device refusal — that is a separate precondition,
+ * because `relocate_subvol` legitimately targets a *mounted* filesystem while
+ * `format_mount` must refuse one.
  */
-export function confirmMatches(
+export function identityMismatches(
   dev: BlockDevice | null,
   confirm: ConfirmDevice,
   targetPath: string,
-): { ok: boolean; reasons: string[] } {
+): string[] {
+  if (!dev) return [`target device "${targetPath}" not found in live topology`];
   const reasons: string[] = [];
-  if (!dev) {
-    return {
-      ok: false,
-      reasons: [`target device "${targetPath}" not found in live topology`],
-    };
-  }
   if (confirm.serial != null && dev.serial !== confirm.serial) {
     reasons.push(
       `serial mismatch: confirmDevice=${confirm.serial} live=${dev.serial ?? "(none)"}`,
@@ -372,7 +422,20 @@ export function confirmMatches(
       } or is mounted) but confirmDevice.empty=true`,
     );
   }
-  if (isMounted(dev)) {
+  return reasons;
+}
+
+/**
+ * `format_mount`'s guard: identity match AND a hard refusal to touch a mounted
+ * device (never format a live filesystem). Returns every failing reason.
+ */
+export function confirmMatches(
+  dev: BlockDevice | null,
+  confirm: ConfirmDevice,
+  targetPath: string,
+): { ok: boolean; reasons: string[] } {
+  const reasons = identityMismatches(dev, confirm, targetPath);
+  if (dev && isMounted(dev)) {
     reasons.push(
       `device "${targetPath}" (or a partition of it) is currently mounted — refusing to format a live filesystem`,
     );
@@ -412,6 +475,10 @@ export function mergeFstab(
   mountpoint: string,
   newLine: string,
 ): { content: string; replaced: number } {
+  // Normalise a trailing slash (except for root "/") so "/mnt/x" and "/mnt/x/"
+  // are treated as the same mountpoint and never accrue duplicate entries.
+  const norm = (m: string) => (m.length > 1 ? m.replace(/\/+$/, "") : m);
+  const target = norm(mountpoint);
   const lines = existing.replace(/\n+$/, "").split("\n");
   const kept: string[] = [];
   let replaced = 0;
@@ -419,7 +486,7 @@ export function mergeFstab(
     const trimmed = line.trim();
     if (trimmed && !trimmed.startsWith("#")) {
       const fields = trimmed.split(/\s+/);
-      if (fields[1] === mountpoint) {
+      if (fields[1] !== undefined && norm(fields[1]) === target) {
         replaced++;
         continue;
       }
@@ -472,7 +539,9 @@ export function planFormatMount(
   if (args.mkfsArgs) mkfs.push(args.mkfsArgs);
   mkfs.push(target);
   cmds.push(mkfs.join(" "));
-  cmds.push(`blkid -s UUID -o value ${target}`);
+  // `-c /dev/null` bypasses the blkid cache so a reformat never reads a stale
+  // (previous-filesystem) UUID and writes it into fstab.
+  cmds.push(`blkid -c /dev/null -s UUID -o value ${target}`);
   cmds.push(`mkdir -p ${args.mountpoint}`);
   const fstabLine = buildFstabLine({
     uuid: "{{NEW_UUID}}",
@@ -480,9 +549,11 @@ export function planFormatMount(
     fstype: args.fstype,
     options: args.fstabOptions ?? "defaults",
   });
-  cmds.push(`# back up /etc/fstab, then idempotently add: ${fstabLine}`);
+  cmds.push(
+    `# back up /etc/fstab (timestamped), then idempotently add via base64: ${fstabLine}`,
+  );
   cmds.push(`mount ${args.mountpoint}`);
-  cmds.push(`findmnt --real ${args.mountpoint}`);
+  cmds.push(`findmnt --real -n ${args.mountpoint}`);
   return { orderedCommands: cmds, fstabLine, target };
 }
 
@@ -523,12 +594,15 @@ export function planRelocateSubvol(
   const cmds = [
     `btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
     `sync`,
-    `btrfs send ${snapPath} | btrfs receive ${args.targetMount}`,
+    // pipefail so a failing `send` isn't masked by a succeeding `receive`
+    // (bash `$?` is the last stage's status without it).
+    `set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount}`,
     `btrfs subvolume show ${snapPath}`,
     `btrfs subvolume show ${received}`,
     `find ${snapPath} -xdev | wc -l`,
     `find ${received} -xdev | wc -l`,
-    `du -sb ${snapPath} ${received}`,
+    `du -sb ${snapPath} | cut -f1`,
+    `du -sb ${received} | cut -f1`,
   ];
   let fstabLine: string | null = null;
   if (args.repoint) {
@@ -597,9 +671,23 @@ export async function collectStorage(
 // Model
 // ————————————————————————————————————————————————————————————————
 
-const HEREDOC = "SWAMP_FSTAB_EOF";
+/** base64-encode UTF-8 text (fstab is ASCII, but encode bytes to be safe). */
+export function b64encode(text: string): string {
+  let bin = "";
+  for (const byte of new TextEncoder().encode(text)) {
+    bin += String.fromCharCode(byte);
+  }
+  return btoa(bin);
+}
 
-/** Read /etc/fstab, back it up, and write the idempotently-merged content. */
+/**
+ * Read /etc/fstab, back it up (timestamped), and write the idempotently-merged
+ * content. The write goes through a single base64 pipeline — NOT a heredoc:
+ * `session.run` appends a `; echo <sentinel>` to every command, which would land
+ * on the heredoc terminator line and stop it from ever closing (truncating the
+ * file and wedging the shell). The base64 form is one command with no delimiter
+ * to break and no shell-metacharacter exposure (base64 is `[A-Za-z0-9+/=]`).
+ */
 async function persistFstab(
   session: Session,
   mountpoint: string,
@@ -607,13 +695,13 @@ async function persistFstab(
 ): Promise<{ replaced: number; backup: string }> {
   const existing = (await session.run("cat /etc/fstab")).stdout;
   const { content, replaced } = mergeFstab(existing, mountpoint, line);
-  const backup = "/etc/fstab.swamp-bak";
+  const backup = `/etc/fstab.swamp-bak.${Date.now()}`;
   const bk = await session.run(`cp -a /etc/fstab ${backup}`);
   if (bk.exitCode !== 0) {
     throw new Error(`could not back up /etc/fstab (rc=${bk.exitCode})`);
   }
   const wr = await session.run(
-    `cat > /etc/fstab <<'${HEREDOC}'\n${content}${HEREDOC}`,
+    `printf '%s' '${b64encode(content)}' | base64 -d > /etc/fstab`,
   );
   if (wr.exitCode !== 0) {
     throw new Error(`could not write /etc/fstab (rc=${wr.exitCode})`);
@@ -688,19 +776,27 @@ export const model = {
       description:
         "Format a device (optionally partition it first) and persist a nofail mount. MUTATING. Defaults to dryRun=true (writes a `plan`, executes nothing); a live run requires `confirmDevice` and refuses on any identity mismatch, a mounted target, or an existing filesystem signature (unless wipe=true).",
       arguments: z.object({
-        device: z.string().min(1).describe("Target block device, e.g. /dev/mmcblk2."),
+        device: z.string().min(1).regex(SAFE_PATH_RE).describe(
+          "Target block device, e.g. /dev/mmcblk2.",
+        ),
         partition: z.boolean().default(false).describe(
           "Create a single GPT partition spanning the device, then format that partition.",
         ),
-        fstype: z.string().default("btrfs").describe("Filesystem type to create."),
-        label: z.string().optional().describe("Filesystem label."),
-        mkfsArgs: z.string().optional().describe("Extra args passed to mkfs.<fstype>."),
-        mountpoint: z.string().min(1).describe("Mount path, e.g. /mnt/data."),
-        fstabOptions: z.string().optional().describe(
+        fstype: z.string().regex(SAFE_LABEL_RE).default("btrfs").describe(
+          "Filesystem type to create.",
+        ),
+        label: z.string().regex(SAFE_LABEL_RE).optional().describe("Filesystem label."),
+        mkfsArgs: z.string().regex(SAFE_OPTS_RE).optional().describe(
+          "Extra args passed to mkfs.<fstype> (no shell metacharacters).",
+        ),
+        mountpoint: z.string().min(1).regex(SAFE_PATH_RE).describe(
+          "Mount path, e.g. /mnt/data.",
+        ),
+        fstabOptions: z.string().regex(SAFE_OPTS_RE).optional().describe(
           "fstab mount options; `nofail` and a device timeout are always forced on.",
         ),
         wipe: z.boolean().default(false).describe(
-          "wipefs -a before mkfs. When false, an existing fs signature is a hard refusal.",
+          "wipefs -a before mkfs. When false, a non-empty device (any existing fs or partition) is a hard refusal.",
         ),
         dryRun: z.boolean().default(true).describe(
           "Preview only: write the plan, execute nothing. Default true.",
@@ -794,6 +890,15 @@ export const model = {
               "run a dry run first, then pass the target's identity to confirm.",
           );
         }
+        // In-method shell-safety backstop (the schema already rejects these,
+        // but never interpolate an unchecked value into a root command).
+        assertSafe(args.device, SAFE_PATH_RE, "device");
+        assertSafe(args.mountpoint, SAFE_PATH_RE, "mountpoint");
+        assertSafe(args.fstype, SAFE_LABEL_RE, "fstype");
+        if (args.label) assertSafe(args.label, SAFE_LABEL_RE, "label");
+        if (args.mkfsArgs) assertSafe(args.mkfsArgs, SAFE_OPTS_RE, "mkfsArgs");
+        if (args.fstabOptions) assertSafe(args.fstabOptions, SAFE_OPTS_RE, "fstabOptions");
+
         const result = await withSession(g, context.logger, async (session) => {
           const facts = await collectStorage((c) => session.run(c));
           const dev = findDevice(facts.blockDevices, args.device);
@@ -803,11 +908,19 @@ export const model = {
               `format_mount refused for ${args.device}: ${guard.reasons.join("; ")}`,
             );
           }
-          // dev is non-null here (guard would have failed otherwise).
-          if (!args.wipe && dev!.fstype) {
+          // dev is non-null here (guard would have failed otherwise). Refuse a
+          // device that isn't empty (any existing fs OR partition table OR
+          // mount) unless wipe — checking the whole subtree, not just the
+          // whole-disk fstype, so a partitioned disk can't be silently clobbered.
+          if (!args.wipe && !isEmpty(dev!)) {
+            const why = dev!.fstype
+              ? `carries a ${dev!.fstype} filesystem`
+              : dev!.children.length
+              ? `has ${dev!.children.length} partition(s)`
+              : `is in use`;
             throw new Error(
-              `format_mount refused: ${args.device} already carries a ${dev!.fstype} ` +
-                `filesystem and wipe=false. Pass wipe=true to overwrite deliberately.`,
+              `format_mount refused: ${args.device} ${why} and wipe=false. ` +
+                `Pass wipe=true to overwrite deliberately.`,
             );
           }
           const target = args.partition
@@ -832,7 +945,8 @@ export const model = {
           mkfs.push(target);
           await step(mkfs.join(" "));
 
-          const uuid = (await step(`blkid -s UUID -o value ${target}`)).stdout.trim();
+          const uuid =
+            (await step(`blkid -c /dev/null -s UUID -o value ${target}`)).stdout.trim();
           if (!/^[0-9a-fA-F-]{8,}$/.test(uuid)) {
             throw new Error(`could not read a UUID for ${target} after mkfs (got "${uuid}")`);
           }
@@ -881,13 +995,19 @@ export const model = {
       description:
         "Copy a btrfs subvolume to another (already-formatted) btrfs via `btrfs send | receive`, verify the received copy, and optionally repoint fstab (nofail). MUTATING but ADDITIVE — never deletes the source. Defaults to dryRun=true; a live run requires `confirmDevice`.",
       arguments: z.object({
-        sourceSubvol: z.string().min(1).describe("Live subvolume path to copy, e.g. /var."),
-        targetMount: z.string().min(1).describe("Mounted destination btrfs, e.g. /mnt/newdisk."),
-        snapshotName: z.string().optional().describe("Read-only snapshot name/path to send."),
+        sourceSubvol: z.string().min(1).regex(SAFE_PATH_RE).describe(
+          "Live subvolume path to copy, e.g. /var.",
+        ),
+        targetMount: z.string().min(1).regex(SAFE_PATH_RE).describe(
+          "Mounted destination btrfs, e.g. /mnt/newdisk.",
+        ),
+        snapshotName: z.string().regex(SAFE_LABEL_RE).optional().describe(
+          "Read-only snapshot name to send (a leaf name, not a path).",
+        ),
         repoint: z.boolean().default(false).describe(
           "Rewrite fstab so finalMountpoint mounts the received subvol (nofail).",
         ),
-        finalMountpoint: z.string().optional().describe(
+        finalMountpoint: z.string().regex(SAFE_PATH_RE).optional().describe(
           "Where the received subvol should mount after reboot (defaults to sourceSubvol).",
         ),
         dryRun: z.boolean().default(true).describe(
@@ -968,6 +1088,11 @@ export const model = {
             "relocate_subvol live run (dryRun=false) requires `confirmDevice`.",
           );
         }
+        assertSafe(args.sourceSubvol, SAFE_PATH_RE, "sourceSubvol");
+        assertSafe(args.targetMount, SAFE_PATH_RE, "targetMount");
+        if (args.finalMountpoint) {
+          assertSafe(args.finalMountpoint, SAFE_PATH_RE, "finalMountpoint");
+        }
         const result = await withSession(g, context.logger, async (session) => {
           const facts = await collectStorage((c) => session.run(c));
           const targetMount = facts.mounts.find((m) => m.target === args.targetMount);
@@ -976,26 +1101,22 @@ export const model = {
               `relocate_subvol refused: ${args.targetMount} is not a mounted btrfs filesystem.`,
             );
           }
-          // Confirm the identity of the device backing the target mount.
-          const targetDev = findDevice(facts.blockDevices, targetMount.source);
-          const guard = confirmMatches(
-            targetDev ?? {
-              name: "",
-              path: targetMount.source,
-              sizeBytes: null,
-              type: "",
-              mountpoints: [args.targetMount],
-              children: [],
-            },
+          // Confirm the identity of the DISK backing the target mount. The mount
+          // source is a partition (serial/size live on the disk node, not the
+          // partition), so identity must be compared against the parent disk;
+          // and we compare identity ONLY (the target is required to be mounted,
+          // so the mounted-device refusal doesn't apply here).
+          const targetDisk = findDiskFor(facts.blockDevices, targetMount.source);
+          const identityReasons = identityMismatches(
+            targetDisk,
             args.confirmDevice!,
             targetMount.source,
           );
-          // The target IS mounted (we require it), so drop the always-on
-          // "mounted" refusal and judge only the identity fields.
-          const identityReasons = guard.reasons.filter((r) => !r.includes("currently mounted"));
           if (identityReasons.length) {
             throw new Error(
-              `relocate_subvol refused for ${targetMount.source}: ${identityReasons.join("; ")}`,
+              `relocate_subvol refused for ${targetMount.source} (disk ${
+                targetDisk?.path ?? "?"
+              }): ${identityReasons.join("; ")}`,
             );
           }
 
@@ -1014,14 +1135,21 @@ export const model = {
           await step(`btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`);
           await step("sync");
           // send|receive is a single local pipeline; it can run long with no
-          // intermediate output — the session's maxMs bound applies.
-          await step(`btrfs send ${snapPath} | btrfs receive ${args.targetMount}`);
+          // intermediate output — the session's maxMs bound applies. pipefail so
+          // a failing `send` isn't masked by a succeeding `receive`.
+          await step(
+            `set -o pipefail; btrfs send ${snapPath} | btrfs receive ${args.targetMount}`,
+          );
 
-          // Verify: received_uuid of the copy must link the snapshot's uuid.
+          // Verify (never trust the exit code alone):
+          //  1. the received copy's `Received UUID` links the source snapshot's
+          //     own `UUID` (line-anchored so `Parent UUID:` can't false-match),
+          //  2. file counts match, and
+          //  3. byte totals match.
           const srcShow = (await step(`btrfs subvolume show ${snapPath}`)).stdout;
           const dstShow = (await step(`btrfs subvolume show ${received}`)).stdout;
-          const srcUuid = srcShow.match(/\bUUID:\s*([0-9a-f-]+)/i)?.[1];
-          const rcvUuid = dstShow.match(/Received UUID:\s*([0-9a-f-]+)/i)?.[1];
+          const srcUuid = srcShow.match(/^\s*UUID:\s*([0-9a-f-]+)/im)?.[1];
+          const rcvUuid = dstShow.match(/^\s*Received UUID:\s*([0-9a-f-]+)/im)?.[1];
           if (!srcUuid || !rcvUuid || srcUuid !== rcvUuid) {
             throw new Error(
               `relocate verify FAILED: received subvol's Received UUID (${rcvUuid ?? "none"}) ` +
@@ -1035,11 +1163,35 @@ export const model = {
               `relocate verify FAILED: file count differs (source ${srcCount}, received ${dstCount}).`,
             );
           }
+          const srcBytes = (await step(`du -sb ${snapPath} | cut -f1`)).stdout.trim();
+          const dstBytes = (await step(`du -sb ${received} | cut -f1`)).stdout.trim();
+          if (srcBytes !== dstBytes) {
+            throw new Error(
+              `relocate verify FAILED: byte total differs (source ${srcBytes}, received ${dstBytes}).`,
+            );
+          }
 
           let fstab: { replaced: number; backup: string } | null = null;
-          if (args.repoint && plan.fstabLine) {
+          let fstabLine: string | null = null;
+          if (args.repoint) {
             const mp = args.finalMountpoint ?? args.sourceSubvol;
-            fstab = await persistFstab(session, mp, plan.fstabLine);
+            // The received subvol's fs-root-relative path (btrfs subvolume show
+            // prints it as the first, colon-free line) — correct even if the
+            // target isn't mounted at the btrfs top level. Falls back to the
+            // basename for the top-level-mount case.
+            const subvolFsPath = dstShow.split("\n")
+              .map((l) => l.trim())
+              .find((l) => l !== "" && !l.includes(":")) ?? snapBase;
+            const src0 = targetMount.source.replace(/\[.*$/, "");
+            const fsUuid =
+              (await step(`blkid -c /dev/null -s UUID -o value ${src0}`)).stdout.trim();
+            fstabLine = buildFstabLine({
+              uuid: fsUuid,
+              mountpoint: mp,
+              fstype: "btrfs",
+              options: `subvol=${subvolFsPath}`,
+            });
+            fstab = await persistFstab(session, mp, fstabLine);
           }
 
           return {
@@ -1048,14 +1200,15 @@ export const model = {
             source: received,
             uuid: rcvUuid,
             fstype: "btrfs",
-            options: plan.fstabLine ? ensureNofail(`subvol=${snapBase}`) : null,
+            options: fstabLine ? ensureNofail(`subvol=${snapBase}`) : null,
             verifiedAt: new Date().toISOString(),
             details: {
               snapshot: snapPath,
               received,
               fileCount: Number(dstCount),
+              byteTotal: Number(dstBytes),
               repointed: args.repoint,
-              fstabLine: plan.fstabLine,
+              fstabLine,
               fstabReplaced: fstab?.replaced ?? null,
               fstabBackup: fstab?.backup ?? null,
               sourcePreserved: true,

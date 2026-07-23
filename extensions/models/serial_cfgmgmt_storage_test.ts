@@ -12,15 +12,20 @@
  *
  * @module
  */
-import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
+import { assert, assertEquals, assertStringIncludes, assertThrows } from "jsr:@std/assert@1";
 import { type CommandResult, type Session } from "./serial_cfgmgmt_lib.ts";
 import {
+  assertSafe,
+  b64encode,
   buildFstabLine,
   collectStorage,
   confirmMatches,
+  ConfirmDeviceSchema,
   deriveSnapshotPath,
   ensureNofail,
   findDevice,
+  findDiskFor,
+  identityMismatches,
   isEmpty,
   isMounted,
   mergeFstab,
@@ -30,6 +35,9 @@ import {
   partitionPath,
   planFormatMount,
   planRelocateSubvol,
+  SAFE_LABEL_RE,
+  SAFE_OPTS_RE,
+  SAFE_PATH_RE,
   type StorageFacts,
 } from "./serial_cfgmgmt_storage.ts";
 
@@ -395,7 +403,7 @@ Deno.test("planFormatMount previews wipe→partition→mkfs→fstab→mount, nof
   assertStringIncludes(plan.orderedCommands[0], "wipefs -a /dev/mmcblk2");
   assert(plan.orderedCommands.some((c) => c.includes("parted -s /dev/mmcblk2")));
   assert(plan.orderedCommands.some((c) => c.includes("mkfs.btrfs -L scratch /dev/mmcblk2p1")));
-  assert(plan.orderedCommands.some((c) => c.includes("blkid -s UUID")));
+  assert(plan.orderedCommands.some((c) => c.includes("blkid -c /dev/null -s UUID")));
   assertStringIncludes(plan.fstabLine, "{{NEW_UUID}}");
   assertStringIncludes(plan.fstabLine, "nofail");
   // No mkfs before the guard is expressed — the plan never mutates on its own.
@@ -450,4 +458,99 @@ Deno.test("planRelocateSubvol repoint emits a nofail subvol fstab line", () => {
   assertStringIncludes(plan.fstabLine!, "/var btrfs");
   assertStringIncludes(plan.fstabLine!, "subvol=.swamp-reloc-var");
   assertStringIncludes(plan.fstabLine!, "nofail");
+});
+
+Deno.test("planRelocateSubvol send|receive is pipefail-guarded", () => {
+  const plan = planRelocateSubvol(facts(), {
+    sourceSubvol: "/var",
+    targetMount: "/mnt/newdisk",
+    repoint: false,
+  });
+  assert(plan.orderedCommands.some((c) =>
+    c.includes("set -o pipefail;") && c.includes("btrfs send") && c.includes("btrfs receive")
+  ));
+});
+
+// ————————————————————————————————————————————————————————————————
+// Review-fix regression tests (cycle 2)
+// ————————————————————————————————————————————————————————————————
+
+Deno.test("F1: b64encode round-trips fstab content (no heredoc write)", () => {
+  const content = "UUID=x / btrfs defaults,nofail 0 0\n# tab\there\n";
+  assertEquals(atob(b64encode(content)), content);
+  // base64 alphabet only — safe to single-quote into a shell command.
+  assert(/^[A-Za-z0-9+/=]+$/.test(b64encode(content)));
+});
+
+Deno.test("F2: confirmDevice rejects an empty object, accepts one identifying field", () => {
+  assertEquals(ConfirmDeviceSchema.safeParse({}).success, false);
+  assertEquals(ConfirmDeviceSchema.safeParse({ serial: "x" }).success, true);
+  assertEquals(ConfirmDeviceSchema.safeParse({ empty: true }).success, true);
+});
+
+Deno.test("F2: identityMismatches has NO mounted-refusal and matches on the DISK node", () => {
+  const f = facts();
+  const disk = findDevice(f.blockDevices, "/dev/mmcblk1")!; // mounted disk
+  // A mounted disk with a matching serial passes identity (no mount refusal).
+  assertEquals(identityMismatches(disk, { serial: "0xbbbb0002" }, "/dev/mmcblk1"), []);
+  // The partition node carries no serial — matching the disk serial here fails,
+  // which is exactly why relocate must resolve the parent disk.
+  const part = findDevice(f.blockDevices, "/dev/mmcblk1p1")!;
+  assert(identityMismatches(part, { serial: "0xbbbb0002" }, "/dev/mmcblk1p1").length > 0);
+});
+
+Deno.test("F2: findDiskFor resolves a partition (and [/subvol] suffix) to its disk", () => {
+  const f = facts();
+  assertEquals(findDiskFor(f.blockDevices, "/dev/mmcblk1p1")?.path, "/dev/mmcblk1");
+  assertEquals(findDiskFor(f.blockDevices, "/dev/mmcblk1p1[/var]")?.path, "/dev/mmcblk1");
+  assertEquals(findDiskFor(f.blockDevices, "/dev/nope"), null);
+});
+
+Deno.test("F3: a partitioned-but-unmounted disk is NOT empty (wipe=false would refuse)", () => {
+  const [disk] = parseLsblk(JSON.stringify({
+    blockdevices: [{
+      name: "sdb",
+      path: "/dev/sdb",
+      size: 1000,
+      type: "disk",
+      serial: "S1",
+      mountpoints: [null],
+      children: [{
+        name: "sdb1",
+        path: "/dev/sdb1",
+        size: 900,
+        type: "part",
+        fstype: "ext4", // has data, but not mounted
+        mountpoints: [null],
+      }],
+    }],
+  }));
+  assert(!isMounted(disk)); // nothing mounted
+  assert(!isEmpty(disk)); // ...but not empty — the fix keys on this, not disk.fstype
+});
+
+Deno.test("F4: assertSafe blocks shell metacharacters; SAFE_* regexes are strict", () => {
+  assertThrows(() => assertSafe("/mnt/x; rm -rf /", SAFE_PATH_RE, "mountpoint"));
+  assertThrows(() => assertSafe("/mnt/$(id)", SAFE_PATH_RE, "mountpoint"));
+  assertThrows(() => assertSafe("/mnt/a b", SAFE_PATH_RE, "mountpoint")); // whitespace
+  assertThrows(() => assertSafe("a`b`", SAFE_LABEL_RE, "label"));
+  // clean values pass
+  assertSafe("/dev/mmcblk2", SAFE_PATH_RE, "device");
+  assertSafe("scratch", SAFE_LABEL_RE, "label");
+  assertSafe("defaults,nofail,x-systemd.device-timeout=30s", SAFE_OPTS_RE, "opts");
+  assert(!SAFE_OPTS_RE.test("defaults;evil"));
+});
+
+Deno.test("F8: mergeFstab treats /mnt/x and /mnt/x/ as the same mountpoint", () => {
+  const existing = "UUID=old /mnt/x/ btrfs defaults 0 0\n";
+  const line = buildFstabLine({ uuid: "new", mountpoint: "/mnt/x", fstype: "btrfs", options: "defaults" });
+  const r = mergeFstab(existing, "/mnt/x", line);
+  assertEquals(r.replaced, 1); // trailing-slash variant is matched + replaced
+  assert(!r.content.includes("UUID=old"));
+});
+
+Deno.test("F11: extractJson skips a leading stray brace in console residue", () => {
+  const noisy = "[root@board-01 ~]# lsblk -J\n{stray prompt brace}\n" + LSBLK;
+  const devs = parseLsblk(noisy);
+  assertEquals(devs.length, 3); // finds the real payload past the junk brace group
 });
