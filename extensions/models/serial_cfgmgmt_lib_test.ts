@@ -9,16 +9,24 @@
  *
  * @module
  */
-import { assertEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   cleanOutput,
   type CommandResult,
+  ioDeviceFor,
   RC_RE,
   type Session,
   settle,
   splitExitCode,
+  withSession,
 } from "./serial_cfgmgmt_lib.ts";
-import { type Clock, execOn, type SerialPort } from "./serial_port.ts";
+import {
+  type Clock,
+  execOn,
+  type SerialPort,
+  sessionLinkLive,
+  sessionPtyPath,
+} from "./serial_port.ts";
 import { gatherFacts } from "./serial_cfgmgmt_node.ts";
 import {
   detectManager,
@@ -166,6 +174,65 @@ Deno.test("settle stops at maxMs on a console that never goes quiet", async () =
   assertEquals(clock.now() >= 1000, true); // bounded, did not hang
 });
 
+// ── session attach decision ──────────────────────────────────────────────────
+
+Deno.test("ioDeviceFor redirects to the PTY only when a holder is live", () => {
+  const dev = "/dev/ttyUSB9";
+  // No live holder → open the real device (open/close per call, unchanged).
+  assertEquals(ioDeviceFor(dev, false), dev);
+  // Live holder → open its deterministic PTY link instead of the device.
+  assertEquals(ioDeviceFor(dev, true), sessionPtyPath(dev));
+});
+
+Deno.test("sessionLinkLive is true only for a link to an existing target", async () => {
+  const dev = "/dev/ttyTEST-attach";
+  const link = sessionPtyPath(dev); // deterministic, device-derived
+  const target = await Deno.makeTempFile();
+  try {
+    // No link yet → not live (holder never started, or already reaped).
+    assertEquals(await sessionLinkLive(dev), false);
+
+    // Link → live target: a running holder's PTY is present → attach.
+    await Deno.symlink(target, link);
+    assertEquals(await sessionLinkLive(dev), true);
+
+    // Holder died: its /dev/pts target vanishes, leaving a dangling link.
+    // `test -e` follows the symlink, so this reads not-live → fall back.
+    await Deno.remove(target);
+    assertEquals(await sessionLinkLive(dev), false);
+  } finally {
+    await Deno.remove(link).catch(() => {});
+    await Deno.remove(target).catch(() => {});
+  }
+});
+
+Deno.test("requireSession fails fast (no port opened) when no holder is live", async () => {
+  // A device with no holder link → sessionLinkLive false. Strict mode must throw
+  // before any port open, so this never touches hardware. /dev/ttyUSB7 is an
+  // allowed path with (assumed) no live holder in the test environment.
+  const g = {
+    device: "/dev/ttyUSB7",
+    baud: 115200,
+    framing: "8N1",
+    lineEnding: "\n",
+    transport: "auto" as const,
+    prompt: "[#$>] $",
+    idleMs: 1000,
+    maxMs: 15000,
+    settleMs: 0,
+    requireSession: true,
+  };
+  const noop = () => {};
+  const logger = { info: noop, warn: noop, error: noop, debug: noop };
+  await assertRejects(
+    () =>
+      withSession(g, logger as unknown as Parameters<typeof withSession>[1], () =>
+        Promise.resolve("unreached")),
+    Error,
+    "no live session holder",
+  );
+});
+
 // ── sentinel-synced read ─────────────────────────────────────────────────────
 
 Deno.test("RC-synced read skips a residual prompt and stops on the sentinel", async () => {
@@ -233,6 +300,19 @@ Deno.test("gatherFacts parses a Fedora RISC-V board", async () => {
     kernel: "6.16.4-200.spacemit.fc42.riscv64",
     packageManagers: ["dnf", "yum"],
   });
+});
+
+Deno.test("gatherFacts trims console residue trailing the hostname probe", async () => {
+  // The first probe over a held/bracketed-paste shell can pick up a prompt tail
+  // right after the value; the resource key is derived from hostname, so it must
+  // survive that. `\n\n[fe` mimics a stripped-escape prompt fragment seen live.
+  const run = (command: string): Promise<CommandResult> => {
+    if (command === "hostname") {
+      return Promise.resolve(ok("host-01.example.test\n\n[fe"));
+    }
+    return Promise.resolve(ok(""));
+  };
+  assertEquals((await gatherFacts(run)).hostname, "host-01.example.test");
 });
 
 Deno.test("gatherFacts falls back to unknowns when probes are empty", async () => {

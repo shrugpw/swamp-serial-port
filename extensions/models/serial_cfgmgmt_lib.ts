@@ -29,6 +29,8 @@ import {
   loginOn,
   type SerialPort,
   selectTransport,
+  sessionLinkLive,
+  sessionPtyPath,
   withPort,
 } from "./serial_port.ts";
 
@@ -87,6 +89,9 @@ export const ConnectionGlobals = {
   ),
   settleMs: z.number().int().min(0).max(60_000).default(0).describe(
     "Before the first command, drain the console to quiet for this many ms and discard stale buffered output (residual login/shell prompt, MOTD tail, late printk). 0 disables — commands already synchronize on their `__RC:<n>:RC__` output sentinel, so a settle is only insurance for the login preamble.",
+  ),
+  requireSession: z.boolean().default(false).describe(
+    "Strict mode: fail unless a live `serial-port` session holder owns the device (start one with `session_start`). Off by default — calls auto-attach to a holder when present and otherwise open/close the port per call. Set true in workflows (or any caller that needs cross-call shell state guaranteed) so a missing holder is a hard error, not a silent fall back to per-call opens.",
   ),
 };
 
@@ -196,6 +201,24 @@ function portConfig(g: ConnectionArgs) {
 }
 
 /**
+ * Which device path to actually open. When a live socat holder owns the real
+ * device (see {@link sessionLinkLive}), I/O is redirected to its PTY so the
+ * logged-in shell persists across separate cfgmgmt runs (logout→login→gather as
+ * distinct method runs, or a workflow chaining serial steps). Bookkeeping, the
+ * allowlist check, and error messages stay on the real `device`; only the byte
+ * path moves to the PTY. Falls back to the real device when no holder is live.
+ * Pure and injectable so the attach decision is unit-testable.
+ */
+export function ioDeviceFor(device: string, live: boolean): string {
+  return live ? sessionPtyPath(device) : device;
+}
+
+/** Attach drain bounds: clear stale PTY bytes buffered while no client was
+ * attached, before the first login/command (mirrors serial-port's attach). */
+const SESSION_DRAIN_IDLE_MS = 200;
+const SESSION_DRAIN_MAX_MS = 1500;
+
+/**
  * Open the console, authenticate a getty when credentials are configured
  * (otherwise nudge to a fresh prompt), run `fn` against a {@link Session}, and
  * always close the port. `loginOn` is a no-op login when the board already sits
@@ -210,10 +233,40 @@ export async function withSession<T>(
   const stopRe = new RegExp(g.prompt);
   const cfg = portConfig(g);
 
+  // Attach to a live socat holder (started via `serial-port session_start` on the
+  // same host device) so the login + shell state survive across separate runs.
+  // The holder's `session` resource lives on the serial-port instance, invisible
+  // here, so liveness is decided host-side by the deterministic PTY link path.
+  const attached = await sessionLinkLive(g.device);
+  if (g.requireSession && !attached) {
+    throw new Error(
+      `requireSession is set but no live session holder owns ${g.device}. ` +
+        `Start one with \`session_start\` on the serial-port model bound to ` +
+        `this device before running this method.`,
+    );
+  }
+  const ioCfg = { ...cfg, device: ioDeviceFor(g.device, attached) };
+  if (attached) {
+    logger.info("Attaching to held session on {device} via {pty}", {
+      device: g.device,
+      pty: ioCfg.device,
+    });
+  }
+
   return await withPort(
     selectTransport(g.transport, logger),
-    cfg,
+    ioCfg,
     async (port: SerialPort) => {
+      // Attached: sweep bytes the PTY buffered while no client was attached
+      // (a prior call's tail, async console output) so they can't confuse the
+      // login prompt detection below. The post-login drain is what keeps them
+      // out of the first command's output.
+      if (attached) {
+        await settle(port, {
+          settleMs: SESSION_DRAIN_IDLE_MS,
+          maxMs: SESSION_DRAIN_MAX_MS,
+        });
+      }
       if (g.username && g.password) {
         const res = await loginOn(port, {
           username: g.username,
@@ -246,13 +299,18 @@ export async function withSession<T>(
         });
       }
 
-      // Optional insurance: drain any stale buffered prompt/MOTD tail to quiet
-      // before the first command. Off by default — the sentinel-synced reads
-      // below already tolerate a stranded prompt.
-      if (g.settleMs > 0) {
+      // Drain the post-login residue (prompt, MOTD tail, bracketed-paste /
+      // cursor escapes bash emits when readline starts) to quiet before the
+      // first command, so it can't bleed into that command's captured output.
+      // Always done when attached — over the PTY that residue reliably trails
+      // into the first `session.run` (observed polluting the hostname probe);
+      // otherwise it's opt-in insurance via `settleMs` (the sentinel-synced
+      // reads below already tolerate a stranded prompt on the open/close path).
+      if (attached || g.settleMs > 0) {
+        const idle = attached ? SESSION_DRAIN_IDLE_MS : g.settleMs;
         await settle(port, {
-          settleMs: g.settleMs,
-          maxMs: Math.max(g.settleMs * 8, 2000),
+          settleMs: idle,
+          maxMs: attached ? SESSION_DRAIN_MAX_MS : Math.max(g.settleMs * 8, 2000),
         });
       }
 

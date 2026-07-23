@@ -692,6 +692,26 @@ async function isSessionLive(s: SessionResource): Promise<boolean> {
 }
 
 /**
+ * Host-level liveness for a device's held session, usable by callers that cannot
+ * read the (instance-scoped) `session` resource — notably the sibling
+ * `@shrug/serial-cfgmgmt/*` types, whose model instance differs from the one the
+ * `serial-port` `session_start` recorded the resource on. Both share the same
+ * host device, and the PTY link path is deterministic (`sessionPtyPath`), so a
+ * `test -e` on that link is enough to decide whether to attach: `-e` follows the
+ * symlink to `/dev/pts/N`, which disappears when the socat holder dies, so a dead
+ * holder reads false and the caller transparently falls back to open/close.
+ *
+ * This is deliberately weaker than {@link isSessionLive} (link-only, no pid
+ * check) because a cross-model caller has no pid to check. The residual risk —
+ * an unrelated process reusing the exact `/dev/pts/N` the stale link still points
+ * at — is negligible and the same class `isSessionLive`'s pid check guards
+ * against; cfgmgmt simply can't perform that check.
+ */
+export async function sessionLinkLive(device: string): Promise<boolean> {
+  return await linkExists(sessionPtyPath(device));
+}
+
+/**
  * Spawn a detached `socat` that owns `cfg.device` and exposes it as `ptyLink`.
  * `setsid` puts it in a new session (no SIGHUP when the spawning run exits) and
  * its stdio is redirected to a log file, so this returns as soon as the shell

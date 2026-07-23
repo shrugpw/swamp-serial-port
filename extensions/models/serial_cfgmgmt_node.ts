@@ -67,7 +67,16 @@ export async function gatherFacts(
     }
   }
 
-  const hostname = (await run("hostname")).stdout.trim();
+  // Keep only the leading valid-hostname run. `hostname` is the first probe and
+  // so the most exposed to residue trailing in from the login/prompt transition
+  // over a dumb console (e.g. a bracketed-paste-mode prompt tail that arrives
+  // right after the value); left raw it would poison the resource key, which is
+  // derived from this field. A hostname is only `[A-Za-z0-9.-]`, so truncating
+  // at the first foreign byte is lossless for a real value and byte-compatible
+  // with `@adam/cfgmgmt/node` (whose SSH output never carries such residue).
+  const hostname = (await run("hostname")).stdout
+    .trim()
+    .replace(/[^A-Za-z0-9.-].*$/s, "");
 
   // One round-trip: each present executable prints `PM:<bin>`.
   const bins = PROBES.map(([, bin]) => bin).join(" ");
