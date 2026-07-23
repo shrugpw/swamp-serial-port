@@ -58,6 +58,23 @@
  * @module
  */
 import { z } from "npm:zod@4";
+import {
+  captureBytes as captureBytesOf,
+  type CaptureThresholds,
+  computeReadPlan,
+  loadThresholds,
+  planRotation,
+  prevCapturePath,
+  readCaptureRange,
+  removeRing,
+  retainedStart as retainedStartOf,
+  ringReadPort,
+  rotateRing,
+  sessionCapturePath,
+  startDrainer,
+  stopDrainer,
+  toBase64,
+} from "./serial_capture.ts";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -188,8 +205,63 @@ const SessionResourceSchema = z.object({
   live: z.boolean().describe("Liveness at the time this record was written."),
   checkedAt: z.iso.datetime(),
   stoppedAt: z.iso.datetime().optional(),
+  // ── Rolling capture (Design B) — all optional so non-capturing holders and
+  // pre-capture records validate unchanged. Canonical stored state:
+  capturing: z.boolean().optional().describe(
+    "Whether a drainer is appending all console bytes to the ring.",
+  ),
+  capturePath: z.string().optional().describe("The on-disk capture ring path."),
+  drainerPid: z.number().int().optional().describe(
+    "PID of the detached drainer that owns the PTY slave.",
+  ),
+  captureMaxBytes: z.number().optional().describe(
+    "Rotate the ring when the total stream length crosses this.",
+  ),
+  captureBase: z.number().optional().describe(
+    "Stream offset where the current ring file begins (Σ rotated sizes).",
+  ),
+  prevSize: z.number().optional().describe(
+    "Size of the retained `.1` file (0 when nothing has rotated).",
+  ),
+  cursor: z.number().optional().describe(
+    "Saved read cursor (stream offset) advanced by capture_read.",
+  ),
+  // Derived, refreshed on session_status / capture_read (informational):
+  captureBytes: z.number().optional().describe(
+    "Total stream length ever produced = captureBase + size(current).",
+  ),
+  retainedStart: z.number().optional().describe(
+    "Lowest still-readable stream offset = captureBase − prevSize.",
+  ),
+  lagBytes: z.number().optional().describe(
+    "Unread bytes behind the cursor = captureBytes − cursor.",
+  ),
 });
 type SessionResource = z.infer<typeof SessionResourceSchema>;
+
+/** Default ring bound: rotate when the stream crosses 4 MiB (two-file window). */
+const DEFAULT_CAPTURE_MAX_BYTES = 4_194_304;
+/** Ceiling on a single capture_read (a 4 MiB ring is ~5.6 MiB of base64). */
+const CAPTURE_READ_MAX_BYTES = 1_048_576;
+
+const CaptureReadResourceSchema = z.object({
+  device: z.string(),
+  readAt: z.iso.datetime(),
+  fromOffset: z.number().describe(
+    "Stream offset actually served (clamped up when the request was evicted).",
+  ),
+  nextOffset: z.number().describe(
+    "The new cursor = fromOffset + bytes served.",
+  ),
+  evicted: z.boolean().describe(
+    "The requested offset had rolled off below retainedStart.",
+  ),
+  lagBytes: z.number().describe(
+    "Unread bytes still behind = captureBytes − nextOffset.",
+  ),
+  bytes: z.number().describe("Number of decoded bytes carried in `data`."),
+  data: z.string().describe("The captured console bytes, base64-encoded."),
+});
 
 // ── Device allow-list ───────────────────────────────────────────────────────
 
@@ -1075,17 +1147,33 @@ async function readSession(
 async function resolveConfig(
   context: MethodContext,
   args: Overrides,
-): Promise<{ cfg: PortConfig; ioCfg: PortConfig; attached: boolean }> {
+): Promise<
+  {
+    cfg: PortConfig;
+    ioCfg: PortConfig;
+    attached: boolean;
+    capturing: boolean;
+    ringPath?: string;
+  }
+> {
   const cfg = await resolveLineConfig(context, args);
   const session = await readSession(context, cfg.device);
   if (session && await isSessionLive(session)) {
+    const capturing = session.capturing === true &&
+      typeof session.capturePath === "string";
     context.logger.info("Attaching to held session on {device} via {pty}", {
       device: cfg.device,
       pty: session.ptyLink,
     });
-    return { cfg, ioCfg: { ...cfg, device: session.ptyLink }, attached: true };
+    return {
+      cfg,
+      ioCfg: { ...cfg, device: session.ptyLink },
+      attached: true,
+      capturing,
+      ringPath: capturing ? session.capturePath : undefined,
+    };
   }
-  return { cfg, ioCfg: cfg, attached: false };
+  return { cfg, ioCfg: cfg, attached: false, capturing: false };
 }
 
 /** Attach drain bounds: clear stale PTY bytes before an attached command. */
@@ -1103,6 +1191,41 @@ async function drainStaleOnAttach(port: SerialPort): Promise<void> {
 /** The transport for this method call, per the `transport` global. */
 function transportFor(context: MethodContext): Transport {
   return selectTransport(context.globalArgs.transport, context.logger);
+}
+
+/**
+ * Bound the ring: if the total stream length has crossed `captureMaxBytes`,
+ * rotate (current → `.1`, discard old `.1`, fresh current + fresh drainer) and
+ * return the updated thresholds + new drainer pid. Returns null when no rotation
+ * is due. Called only from `capture_read`, a serial-port-model operation holding
+ * the model lock — so it never overlaps an in-flight `exec`/`read` (the drainer
+ * itself never self-rotates; that is what makes this the serialisation point).
+ */
+async function maybeRotate(
+  session: SessionResource,
+): Promise<
+  { captureBase: number; prevSize: number; drainerPid: number } | null
+> {
+  const ringPath = session.capturePath;
+  if (!ringPath) return null;
+  const t: CaptureThresholds = await loadThresholds(
+    ringPath,
+    session.captureBase ?? 0,
+    session.prevSize ?? 0,
+  );
+  const max = session.captureMaxBytes ?? DEFAULT_CAPTURE_MAX_BYTES;
+  const plan = planRotation(t, max);
+  if (!plan.rotate) return null;
+  const drainerPid = await rotateRing(
+    session.ptyLink,
+    ringPath,
+    session.drainerPid ?? null,
+  );
+  return {
+    captureBase: plan.newCaptureBase,
+    prevSize: plan.newPrevSize,
+    drainerPid,
+  };
 }
 
 // ── Model ───────────────────────────────────────────────────────────────────
@@ -1147,6 +1270,12 @@ export const model = {
       description:
         "A persistent socat session holder for the port (pid + PTY link).",
       schema: SessionResourceSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
+    captureRead: {
+      description: "Result of a capture_read (base64 bytes + offset cursor).",
+      schema: CaptureReadResourceSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
@@ -1264,13 +1393,26 @@ export const model = {
         context: MethodContext,
       ): Promise<Handles> => {
         // `read` wants whatever the port (or held PTY) has buffered, so it
-        // deliberately does NOT drain on attach.
-        const { cfg, ioCfg } = await resolveConfig(context, args);
+        // deliberately does NOT drain on attach. Under capture the drainer owns
+        // the one PTY slave, so read forward from the ring instead of the PTY
+        // (two readers would split the stream). capture_read is the cursor/paging
+        // API; this drains bytes arriving during the idle window.
+        const { cfg, ioCfg, capturing, ringPath } = await resolveConfig(
+          context,
+          args,
+        );
         const { output } = await withPort(
           transportFor(context),
           ioCfg,
-          (port) =>
-            drainUntil(port, { idleMs: args.idleMs, maxMs: args.maxMs }),
+          async (port) => {
+            const rport = capturing && ringPath
+              ? await ringReadPort(port, ringPath)
+              : port;
+            return drainUntil(rport, {
+              idleMs: args.idleMs,
+              maxMs: args.maxMs,
+            });
+          },
         );
         context.logger.info("Read {n} bytes from {device}", {
           n: output.length,
@@ -1315,13 +1457,20 @@ export const model = {
         },
         context: MethodContext,
       ): Promise<Handles> => {
-        const { cfg, ioCfg, attached } = await resolveConfig(context, args);
+        const { cfg, ioCfg, attached, capturing, ringPath } =
+          await resolveConfig(context, args);
         const result = await withPort(
           transportFor(context),
           ioCfg,
           async (port) => {
-            if (attached) await drainStaleOnAttach(port);
-            return execOn(port, {
+            // Under capture, record the ring end and read the response forward
+            // from there; the drainer is the sole PTY reader, so the §2b
+            // per-call stale-drain is retired (nothing else buffers the PTY).
+            const rport = capturing && ringPath
+              ? await ringReadPort(port, ringPath)
+              : port;
+            if (attached && !capturing) await drainStaleOnAttach(port);
+            return execOn(rport, {
               command: args.command,
               lineEnding: cfg.lineEnding,
               prompt: toRegex(args.prompt),
@@ -1378,7 +1527,8 @@ export const model = {
         context: MethodContext,
       ): Promise<Handles> => {
         const g = context.globalArgs;
-        const { cfg, ioCfg, attached } = await resolveConfig(context, args);
+        const { cfg, ioCfg, attached, capturing, ringPath } =
+          await resolveConfig(context, args);
         const username = args.username ?? g.username;
         if (!username) {
           throw new Error(
@@ -1395,8 +1545,11 @@ export const model = {
           transportFor(context),
           ioCfg,
           async (port) => {
-            if (attached) await drainStaleOnAttach(port);
-            return loginOn(port, {
+            const rport = capturing && ringPath
+              ? await ringReadPort(port, ringPath)
+              : port;
+            if (attached && !capturing) await drainStaleOnAttach(port);
+            return loginOn(rport, {
               username,
               password,
               lineEnding: cfg.lineEnding,
@@ -1427,10 +1580,20 @@ export const model = {
     },
     session_start: {
       description:
-        "Start a persistent session holder: a detached `socat` opens the port once and bridges it to a PTY, so the logged-in shell survives across separate method runs. Later send/read/exec/login (and serial-cfgmgmt) calls automatically attach to the holder. Idempotency: errors if one is already live — stop it first with session_stop.",
-      arguments: z.object({ ...OverrideArgs }),
+        "Start a persistent session holder: a detached `socat` opens the port once and bridges it to a PTY, so the logged-in shell survives across separate method runs. Later send/read/exec/login (and serial-cfgmgmt) calls automatically attach to the holder. With capture=true, also spawn a drainer that appends ALL console bytes to an on-disk ring, capturing output emitted while no client is attached (async printk, panic traces); read it with capture_read. Idempotency: errors if one is already live — stop it first with session_stop.",
+      arguments: z.object({
+        capture: z.boolean().default(false).describe(
+          "Also spawn a drainer that records all console bytes to a ring (read with capture_read).",
+        ),
+        captureMaxBytes: z.number().int().positive().default(
+          DEFAULT_CAPTURE_MAX_BYTES,
+        ).describe(
+          "Rotate the ring when the total stream length crosses this (append + rotate-on-restart; a two-file .1+current window is retained).",
+        ),
+        ...OverrideArgs,
+      }),
       execute: async (
-        args: Overrides,
+        args: Overrides & { capture: boolean; captureMaxBytes: number },
         context: MethodContext,
       ): Promise<Handles> => {
         const cfg = await resolveLineConfig(context, args);
@@ -1447,6 +1610,28 @@ export const model = {
           "Session holder up on {device} (pid {pid}) → {pty}",
           { device: cfg.device, pid: holderPid, pty: ptyLink },
         );
+        // Capture bookkeeping: a fresh stream starts at 0. Clear any prior ring
+        // (+ .1) so a stale cursor from a previous stream cannot mis-seek this
+        // one; the resource omits `cursor` when capture is off.
+        let capture: Record<string, unknown> = {};
+        if (args.capture) {
+          const capturePath = sessionCapturePath(cfg.device);
+          await removeRing(capturePath);
+          const drainerPid = await startDrainer(ptyLink, capturePath);
+          context.logger.info(
+            "Capture drainer up on {device} (pid {pid}) → {ring}",
+            { device: cfg.device, pid: drainerPid, ring: capturePath },
+          );
+          capture = {
+            capturing: true,
+            capturePath,
+            drainerPid,
+            captureMaxBytes: args.captureMaxBytes,
+            captureBase: 0,
+            prevSize: 0,
+            cursor: 0,
+          };
+        }
         const handle = await context.writeResource(
           "session",
           instanceKey("session", cfg.device),
@@ -1460,6 +1645,7 @@ export const model = {
             startedAt: now,
             live: true,
             checkedAt: now,
+            ...capture,
           },
         );
         return { dataHandles: [handle] };
@@ -1467,10 +1653,15 @@ export const model = {
     },
     session_stop: {
       description:
-        "Stop the persistent session holder on the port (SIGTERM the socat holder, remove the PTY link). Safe to call when none is running.",
-      arguments: z.object({ ...OverrideArgs }),
+        "Stop the persistent session holder on the port (SIGTERM the capture drainer if any, then the socat holder, remove the PTY link). Removes the capture ring unless keepCapture=true. Safe to call when none is running.",
+      arguments: z.object({
+        keepCapture: z.boolean().default(false).describe(
+          "Keep the on-disk capture ring (and its .1) instead of removing it.",
+        ),
+        ...OverrideArgs,
+      }),
       execute: async (
-        args: Overrides,
+        args: Overrides & { keepCapture: boolean },
         context: MethodContext,
       ): Promise<Handles> => {
         const device = args.device ?? context.globalArgs.device;
@@ -1479,12 +1670,20 @@ export const model = {
         const now = new Date().toISOString();
         if (!session) {
           await stopHolder(null, sessionPtyPath(device)); // clear any stray link
+          if (!args.keepCapture) await removeRing(sessionCapturePath(device));
           context.logger.info("No session holder recorded on {device}", {
             device,
           });
           return { dataHandles: [] };
         }
+        // Stop the drainer BEFORE the holder: it reads the holder's PTY slave.
+        if (typeof session.drainerPid === "number") {
+          await stopDrainer(session.drainerPid);
+        }
         await stopHolder(session.holderPid, session.ptyLink);
+        if (!args.keepCapture && typeof session.capturePath === "string") {
+          await removeRing(session.capturePath);
+        }
         context.logger.info("Session holder stopped on {device} (pid {pid})", {
           device,
           pid: session.holderPid,
@@ -1503,6 +1702,10 @@ export const model = {
             live: false,
             checkedAt: now,
             stoppedAt: now,
+            capturing: false,
+            ...(args.keepCapture && typeof session.capturePath === "string"
+              ? { capturePath: session.capturePath }
+              : {}),
           },
         );
         return { dataHandles: [handle] };
@@ -1525,6 +1728,32 @@ export const model = {
           return { dataHandles: [] };
         }
         const live = await isSessionLive(session);
+        // When capturing, refresh the derived offset fields from the live ring.
+        let captureFields: Record<string, unknown> = {};
+        if (
+          session.capturing === true && typeof session.capturePath === "string"
+        ) {
+          const t = await loadThresholds(
+            session.capturePath,
+            session.captureBase ?? 0,
+            session.prevSize ?? 0,
+          );
+          const cBytes = captureBytesOf(t);
+          const rStart = retainedStartOf(t);
+          const cursor = session.cursor ?? 0;
+          captureFields = {
+            capturing: true,
+            capturePath: session.capturePath,
+            drainerPid: session.drainerPid,
+            captureMaxBytes: session.captureMaxBytes,
+            captureBase: t.captureBase,
+            prevSize: t.prevSize,
+            cursor,
+            captureBytes: cBytes,
+            retainedStart: rStart,
+            lagBytes: cBytes - cursor,
+          };
+        }
         context.logger.info("Session on {device}: {state} (pid {pid})", {
           device,
           state: live ? "live" : "dead",
@@ -1544,9 +1773,119 @@ export const model = {
             live,
             checkedAt: now,
             ...(session.stoppedAt ? { stoppedAt: session.stoppedAt } : {}),
+            ...captureFields,
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+    capture_read: {
+      description:
+        "Return console bytes captured to the ring since an offset and advance the saved cursor. Serial-port-instance-only: the offset thresholds live in the `session` resource, which a serial-cfgmgmt/* instance cannot read. Output `data` is base64 (console bytes are binary). Pages: pass sinceOffset / read nextOffset; maxBytes never returns the whole ring. Bounds the ring by rotating when it crosses captureMaxBytes.",
+      arguments: z.object({
+        sinceOffset: z.number().int().nonnegative().optional().describe(
+          "Stream offset to read from; defaults to the saved cursor. An explicit value overrides the cursor for re-read/seek.",
+        ),
+        maxBytes: z.number().int().positive().max(CAPTURE_READ_MAX_BYTES)
+          .default(CAPTURE_READ_MAX_BYTES).describe(
+            "Max bytes to return; page the rest with nextOffset.",
+          ),
+        ...OverrideArgs,
+      }),
+      execute: async (
+        args: Overrides & { sinceOffset?: number; maxBytes: number },
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const device = args.device ?? context.globalArgs.device;
+        assertAllowedDevice(device);
+        const session = await readSession(context, device);
+        if (!session) {
+          throw new Error(
+            `No session holder on ${device}; start one with session_start capture=true.`,
+          );
+        }
+        if (!(await isSessionLive(session))) {
+          throw new Error(
+            `Session holder on ${device} is not live; capture_read needs a running holder.`,
+          );
+        }
+        if (
+          session.capturing !== true || typeof session.capturePath !== "string"
+        ) {
+          throw new Error(
+            `Capture is not active on ${device}; start the holder with capture=true.`,
+          );
+        }
+        const ringPath = session.capturePath;
+        const now = new Date().toISOString();
+        // Bound the ring first (model op holding the lock; the drainer never
+        // self-rotates). A rotation updates captureBase/prevSize and the pid.
+        const rot = await maybeRotate(session);
+        const captureBase = rot?.captureBase ?? (session.captureBase ?? 0);
+        const prevSize = rot?.prevSize ?? (session.prevSize ?? 0);
+        const drainerPid = rot?.drainerPid ?? session.drainerPid;
+        const t = await loadThresholds(ringPath, captureBase, prevSize);
+        const sinceOffset = args.sinceOffset ?? (session.cursor ?? 0);
+        const plan = computeReadPlan(t, sinceOffset, args.maxBytes);
+        const bytes = await readCaptureRange(
+          ringPath,
+          prevCapturePath(ringPath),
+          plan,
+        );
+        const cBytes = captureBytesOf(t);
+        const lagBytes = cBytes - plan.nextOffset;
+        context.logger.info(
+          "capture_read on {device}: {n} bytes [{from}..{next}), lag {lag}, evicted {ev}",
+          {
+            device,
+            n: bytes.length,
+            from: plan.fromOffset,
+            next: plan.nextOffset,
+            lag: lagBytes,
+            ev: plan.evicted,
+          },
+        );
+        const resultHandle = await context.writeResource(
+          "captureRead",
+          instanceKey("captureRead", device),
+          {
+            device,
+            readAt: now,
+            fromOffset: plan.fromOffset,
+            nextOffset: plan.nextOffset,
+            evicted: plan.evicted,
+            lagBytes,
+            bytes: bytes.length,
+            data: toBase64(bytes),
+          },
+        );
+        // Persist the advanced cursor + refreshed thresholds on the session.
+        const sessionHandle = await context.writeResource(
+          "session",
+          instanceKey("session", device),
+          {
+            device: session.device,
+            ptyLink: session.ptyLink,
+            holderPid: session.holderPid,
+            baud: session.baud,
+            framing: session.framing,
+            lineEnding: session.lineEnding,
+            startedAt: session.startedAt,
+            live: true,
+            checkedAt: now,
+            capturing: true,
+            capturePath: ringPath,
+            drainerPid,
+            captureMaxBytes: session.captureMaxBytes,
+            captureBase: t.captureBase,
+            prevSize: t.prevSize,
+            cursor: plan.nextOffset,
+            captureBytes: cBytes,
+            retainedStart: retainedStartOf(t),
+            lagBytes,
+          },
+        );
+        return { dataHandles: [resultHandle, sessionHandle] };
       },
     },
   },
