@@ -113,7 +113,7 @@ Deno.test("cleanOutput strips ANSI, echoed command, and trailing prompt", () => 
   // Real capture shape from a bracketed-paste bash console.
   const raw =
     "\x1b[?2004luname -srm\r\nLinux 6.16.4-200.spacemit.fc42.riscv64 riscv64\r\n" +
-    "\x1b[?2004h\x1b[?2004l[fedora@bpif3-004 ~]$ ";
+    "\x1b[?2004h\x1b[?2004l[user@host ~]$ ";
   assertEquals(
     cleanOutput(raw, "uname -srm"),
     "Linux 6.16.4-200.spacemit.fc42.riscv64 riscv64",
@@ -143,7 +143,7 @@ Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", (
   // A prompt left un-drained by loginOn glues onto the pty echo of the next
   // command; the real output follows. Only "fedora" should survive.
   const raw =
-    "[fedora@bpif3-004 ~]$ id -un\r\nfedora\r\n[fedora@bpif3-004 ~]$ ";
+    "[user@host ~]$ id -un\r\nfedora\r\n[user@host ~]$ ";
   assertEquals(cleanOutput(raw, "id -un"), "fedora");
 });
 
@@ -151,9 +151,9 @@ Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", (
 
 Deno.test("settle drains buffered bytes to quiet, then leaves the port empty", async () => {
   const clock = new FakeClock();
-  const port = new FakePort(["[fedora@bpif3-004 ~]$ "], clock);
+  const port = new FakePort(["[user@host ~]$ "], clock);
   const swept = await settle(port, { settleMs: 300, maxMs: 5000 }, clock);
-  assertEquals(swept, "[fedora@bpif3-004 ~]$ ");
+  assertEquals(swept, "[user@host ~]$ ");
   // A second settle sees nothing — the buffer was fully consumed.
   assertEquals(await settle(port, { settleMs: 300, maxMs: 5000 }, clock), "");
 });
@@ -244,11 +244,11 @@ Deno.test("RC-synced read skips a residual prompt and stops on the sentinel", as
   // skips it and matches only the executed "__RC:0:RC__".
   const port = new FakePort(
     [
-      "[fedora@bpif3-004 ~]$ ", // residual prompt (stale)
+      "[user@host ~]$ ", // residual prompt (stale)
       `${cmd}\r\n`, // pty echo of the wrapped command
       "fedora\r\n", // real output
       "__RC:0:RC__\r\n", // sentinel (digit → matches)
-      "[fedora@bpif3-004 ~]$ ", // trailing prompt (should stay unread)
+      "[user@host ~]$ ", // trailing prompt (should stay unread)
     ],
     clock,
   );
@@ -284,7 +284,7 @@ Deno.test("gatherFacts parses a Fedora RISC-V board", async () => {
       return Promise.resolve(ok('ID=fedora\nVERSION_ID=42\nNAME="Fedora Linux"'));
     }
     if (command === "hostname") {
-      return Promise.resolve(ok("bpif3-004.fedora-riscv.potato.shrug.pw"));
+      return Promise.resolve(ok("host-01.example.test"));
     }
     if (command.startsWith("for b in")) {
       return Promise.resolve(ok("PM:dnf\nPM:yum"));
@@ -293,7 +293,7 @@ Deno.test("gatherFacts parses a Fedora RISC-V board", async () => {
   };
 
   assertEquals(await gatherFacts(run), {
-    hostname: "bpif3-004.fedora-riscv.potato.shrug.pw",
+    hostname: "host-01.example.test",
     os: "fedora",
     osVersion: "42",
     arch: "riscv64",
