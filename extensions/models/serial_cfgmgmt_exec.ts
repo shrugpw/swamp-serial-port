@@ -21,6 +21,15 @@ const ResultSchema = z.object({
   ranAt: z.string(),
 });
 
+/**
+ * Derive a stable, filesystem/instance-safe resource key from a command line:
+ * collapse every run of non-word characters to `_` and bound the length. Keeps
+ * shell metacharacters and path separators out of the resource instance name.
+ */
+export function resourceKey(command: string): string {
+  return command.replace(/\W+/g, "_").slice(0, 60);
+}
+
 export const model = {
   type: "@shrug/serial-cfgmgmt/exec",
   version: "2026.07.22.2",
@@ -54,7 +63,7 @@ export const model = {
         });
         const handle = await context.writeResource(
           "result",
-          args.command.replace(/\W+/g, "_").slice(0, 60),
+          resourceKey(args.command),
           {
             command: args.command,
             stdout: res.stdout,

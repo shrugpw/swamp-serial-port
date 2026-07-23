@@ -1,9 +1,10 @@
 /**
- * Unit tests for the @shrug/serial-cfgmgmt/* family.
+ * Unit tests for the @shrug/serial-cfgmgmt/* shared library.
  *
- * Drives the transport-agnostic logic — console cleaning, exit-code parsing,
- * fact gathering, package/service parsing — against a scripted fake session.
- * NO device required.
+ * Drives the transport-agnostic console logic — output cleaning, exit-code
+ * parsing, settle/drain, and the session-attach decision — against a scripted
+ * fake port. Type-specific parsing (facts/package/service) and the exec key
+ * sanitizer live in the per-model sibling `_test.ts` files. NO device required.
  *
  * Run: `~/.swamp/deno/deno test extensions/models/serial_cfgmgmt_lib_test.ts`
  *
@@ -12,10 +13,8 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   cleanOutput,
-  type CommandResult,
   ioDeviceFor,
   RC_RE,
-  type Session,
   settle,
   splitExitCode,
   withSession,
@@ -27,34 +26,8 @@ import {
   sessionLinkLive,
   sessionPtyPath,
 } from "./serial_port.ts";
-import { gatherFacts } from "./serial_cfgmgmt_node.ts";
-import {
-  detectManager,
-  installCommand,
-  queryPackage,
-} from "./serial_cfgmgmt_package.ts";
-import { queryService } from "./serial_cfgmgmt_service.ts";
 
 // ── Fakes ───────────────────────────────────────────────────────────────────
-
-/** A session that answers each command from a lookup table (regex-keyed). */
-function fakeSession(
-  routes: Array<[RegExp, CommandResult]>,
-): Session & { calls: string[] } {
-  const calls: string[] = [];
-  return {
-    calls,
-    run(command: string): Promise<CommandResult> {
-      calls.push(command);
-      for (const [re, res] of routes) {
-        if (re.test(command)) return Promise.resolve(res);
-      }
-      return Promise.resolve({ stdout: "", exitCode: 127 });
-    },
-  };
-}
-
-const ok = (stdout: string): CommandResult => ({ stdout, exitCode: 0 });
 
 /** A deterministic clock; time only moves when we advance it. */
 class FakeClock implements Clock {
@@ -125,6 +98,13 @@ Deno.test("cleanOutput keeps multi-line stdout intact", () => {
   assertEquals(cleanOutput(raw, "cat file"), "ID=fedora\nVERSION_ID=42");
 });
 
+Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", () => {
+  // A prompt left un-drained by loginOn glues onto the pty echo of the next
+  // command; the real output follows. Only "fedora" should survive.
+  const raw = "[user@host ~]$ id -un\r\nfedora\r\n[user@host ~]$ ";
+  assertEquals(cleanOutput(raw, "id -un"), "fedora");
+});
+
 // ── splitExitCode ────────────────────────────────────────────────────────────
 
 Deno.test("splitExitCode extracts the RC sentinel and strips it from stdout", () => {
@@ -137,14 +117,6 @@ Deno.test("splitExitCode extracts the RC sentinel and strips it from stdout", ()
     stdout: "no sentinel here",
     exitCode: null,
   });
-});
-
-Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", () => {
-  // A prompt left un-drained by loginOn glues onto the pty echo of the next
-  // command; the real output follows. Only "fedora" should survive.
-  const raw =
-    "[user@host ~]$ id -un\r\nfedora\r\n[user@host ~]$ ";
-  assertEquals(cleanOutput(raw, "id -un"), "fedora");
 });
 
 // ── settle ───────────────────────────────────────────────────────────────────
@@ -226,8 +198,11 @@ Deno.test("requireSession fails fast (no port opened) when no holder is live", a
   const logger = { info: noop, warn: noop, error: noop, debug: noop };
   await assertRejects(
     () =>
-      withSession(g, logger as unknown as Parameters<typeof withSession>[1], () =>
-        Promise.resolve("unreached")),
+      withSession(
+        g,
+        logger as unknown as Parameters<typeof withSession>[1],
+        () => Promise.resolve("unreached"),
+      ),
     Error,
     "no live session holder",
   );
@@ -268,116 +243,5 @@ Deno.test("RC-synced read skips a residual prompt and stops on the sentinel", as
   assertEquals(splitExitCode(cleanOutput(output, cmd)), {
     stdout: "fedora",
     exitCode: 0,
-  });
-});
-
-// ── gatherFacts ──────────────────────────────────────────────────────────────
-
-Deno.test("gatherFacts parses a Fedora RISC-V board", async () => {
-  const run = (command: string): Promise<CommandResult> => {
-    if (command.startsWith("uname")) {
-      return Promise.resolve(
-        ok("Linux 6.16.4-200.spacemit.fc42.riscv64 riscv64"),
-      );
-    }
-    if (command.startsWith("cat /etc/os-release")) {
-      return Promise.resolve(ok('ID=fedora\nVERSION_ID=42\nNAME="Fedora Linux"'));
-    }
-    if (command === "hostname") {
-      return Promise.resolve(ok("host-01.example.test"));
-    }
-    if (command.startsWith("for b in")) {
-      return Promise.resolve(ok("PM:dnf\nPM:yum"));
-    }
-    return Promise.resolve({ stdout: "", exitCode: 127 });
-  };
-
-  assertEquals(await gatherFacts(run), {
-    hostname: "host-01.example.test",
-    os: "fedora",
-    osVersion: "42",
-    arch: "riscv64",
-    kernel: "6.16.4-200.spacemit.fc42.riscv64",
-    packageManagers: ["dnf", "yum"],
-  });
-});
-
-Deno.test("gatherFacts trims console residue trailing the hostname probe", async () => {
-  // The first probe over a held/bracketed-paste shell can pick up a prompt tail
-  // right after the value; the resource key is derived from hostname, so it must
-  // survive that. `\n\n[fe` mimics a stripped-escape prompt fragment seen live.
-  const run = (command: string): Promise<CommandResult> => {
-    if (command === "hostname") {
-      return Promise.resolve(ok("host-01.example.test\n\n[fe"));
-    }
-    return Promise.resolve(ok(""));
-  };
-  assertEquals((await gatherFacts(run)).hostname, "host-01.example.test");
-});
-
-Deno.test("gatherFacts falls back to unknowns when probes are empty", async () => {
-  const run = (): Promise<CommandResult> => Promise.resolve(ok(""));
-  const facts = await gatherFacts(run);
-  assertEquals(facts.os, "unknown");
-  assertEquals(facts.osVersion, "unknown");
-  assertEquals(facts.arch, "unknown");
-  assertEquals(facts.packageManagers, []);
-});
-
-// ── package ──────────────────────────────────────────────────────────────────
-
-Deno.test("detectManager returns the first available manager", async () => {
-  const s = fakeSession([[/for b in/, ok("dnf")]]);
-  assertEquals(await detectManager((c) => s.run(c)), "dnf");
-});
-
-Deno.test("queryPackage reports installed + version on rpm exit 0", async () => {
-  const s = fakeSession([[/rpm -q/, ok("2.4.1-1.fc42")]]);
-  assertEquals(await queryPackage(s, "dnf", "htop"), {
-    installed: true,
-    version: "2.4.1-1.fc42",
-  });
-});
-
-Deno.test("queryPackage reports not-installed on non-zero exit", async () => {
-  const s = fakeSession([[/rpm -q/, { stdout: "", exitCode: 1 }]]);
-  assertEquals(await queryPackage(s, "dnf", "nope"), {
-    installed: false,
-    version: null,
-  });
-});
-
-Deno.test("installCommand is manager-appropriate and shell-safe", () => {
-  assertEquals(installCommand("dnf", "htop"), "dnf install -y htop");
-  assertEquals(
-    installCommand("apt-get", "htop"),
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y htop",
-  );
-  assertEquals(installCommand("pacman", "htop"), "pacman -S --noconfirm htop");
-  // Metacharacters are stripped from the package name.
-  assertEquals(installCommand("dnf", "htop; rm -rf /"), "dnf install -y htoprm-rf");
-});
-
-// ── service ──────────────────────────────────────────────────────────────────
-
-Deno.test("queryService parses is-active / is-enabled", async () => {
-  const s = fakeSession([
-    [/is-active/, ok("active")],
-    [/is-enabled/, ok("enabled")],
-  ]);
-  assertEquals(await queryService(s, "sshd.service"), {
-    activeState: "active",
-    enabledState: "enabled",
-  });
-});
-
-Deno.test("queryService tolerates non-zero exits (inactive/disabled)", async () => {
-  const s = fakeSession([
-    [/is-active/, { stdout: "inactive", exitCode: 3 }],
-    [/is-enabled/, { stdout: "disabled", exitCode: 1 }],
-  ]);
-  assertEquals(await queryService(s, "nginx.service"), {
-    activeState: "inactive",
-    enabledState: "disabled",
   });
 });
