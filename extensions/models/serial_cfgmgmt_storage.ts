@@ -653,6 +653,67 @@ export interface RelocateArgs {
   finalMountpoint?: string;
 }
 
+/**
+ * Max poll iterations while waiting for a detached `send|receive` to finish.
+ * Each poll is one serial round-trip (seconds over the console), so this bounds
+ * a stuck copy at a generous wall-clock ceiling without a fixed on-board sleep
+ * (which could exceed a small `idleMs`). `maxMs` also bounds every read.
+ */
+const RELOC_MAX_POLLS = 900;
+
+/**
+ * Host-side pause between `send|receive` completion polls. Paces the loop from
+ * the host (not an on-board `sleep`, which could exceed a small `idleMs`), so
+ * `RELOC_MAX_POLLS × RELOC_POLL_INTERVAL_MS` is the wall-clock ceiling (~15 min)
+ * regardless of how fast an individual poll round-trips.
+ */
+const RELOC_POLL_INTERVAL_MS = 1000;
+
+/**
+ * Bookkeeping-file paths for a detached relocation, derived from the source
+ * subvol so concurrent relocations of different subvols don't collide. The
+ * `send|receive` pipeline runs detached and writes its exit status to `.rc`
+ * (stderr/stdout to `.log`), which the method polls — the shell stays free to
+ * answer polls instead of blocking on a copy that emits no output for minutes.
+ */
+export function relocBookkeeping(
+  sourceSubvol: string,
+): { rcFile: string; logFile: string } {
+  const token = sourceSubvol.replace(/\W+/g, "_").replace(/^_+|_+$/g, "") ||
+    "root";
+  return {
+    rcFile: `/tmp/.swamp-reloc_${token}.rc`,
+    logFile: `/tmp/.swamp-reloc_${token}.log`,
+  };
+}
+
+/**
+ * `find … | wc -l` counting entries under `root` but pruning `relPaths`
+ * (relative to `root`). `btrfs send` never crosses into nested subvolumes, so a
+ * received copy lacks their mountpoints — pruning them on the source side makes
+ * the file-count comparison apples-to-apples. Degrades to a plain `find -xdev`
+ * when there are no nested paths. `bp` is applied by the caller's `step`, not
+ * here, so the command carries no privilege prefix.
+ */
+export function findCountExcluding(root: string, relPaths: string[]): string {
+  const clean = root.replace(/\/+$/, "");
+  if (relPaths.length === 0) return `find ${clean} -xdev | wc -l`;
+  const prunes = relPaths.map((p) => `-path ${clean}/${p}`).join(" -o ");
+  return `find ${clean} -xdev \\( ${prunes} \\) -prune -o -print | wc -l`;
+}
+
+/**
+ * `du -sb … | cut -f1` for the apparent-size byte total under `root`, excluding
+ * `relPaths` (the nested subvolumes `btrfs send` doesn't carry). `-b` reports
+ * apparent size, so the total is independent of compression/allocation
+ * differences between the source and the freshly-formatted target.
+ */
+export function duBytesExcluding(root: string, relPaths: string[]): string {
+  const clean = root.replace(/\/+$/, "");
+  const ex = relPaths.map((p) => `--exclude=${clean}/${p}`).join(" ");
+  return `du -sb ${ex ? `${ex} ` : ""}${clean} | cut -f1`;
+}
+
 /** Snapshot destination for a subvol relocation (sibling `.swamp-reloc-*`). */
 export function deriveSnapshotPath(
   sourceSubvol: string,
@@ -680,14 +741,17 @@ export function planRelocateSubvol(
   const snapPath = deriveSnapshotPath(args.sourceSubvol, args.snapshotName);
   const snapBase = snapPath.slice(snapPath.lastIndexOf("/") + 1);
   const received = `${args.targetMount.replace(/\/+$/, "")}/${snapBase}`;
+  const { rcFile, logFile } = relocBookkeeping(args.sourceSubvol);
   const cmds = [
     `${bp}btrfs subvolume snapshot -r ${args.sourceSubvol} ${snapPath}`,
     `sync`,
-    // pipefail so a failing `send` isn't masked by a succeeding `receive`
-    // (bash `$?` is the last stage's status without it). Scoped to a SUBSHELL so
-    // it doesn't persist into later commands of the held session shell. Each
-    // stage is privilege-escalated independently.
-    `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`,
+    // send|receive is DETACHED (`nohup … &`) so a copy that emits no output for
+    // minutes can't blow past idleMs into a null exit code, nor block the shell.
+    // pipefail so a failing `send` isn't masked by a succeeding `receive`; the
+    // pipeline's exit status is recorded to `rcFile`, which the live path polls.
+    // Each stage is privilege-escalated independently.
+    `nohup sh -c 'set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount}; echo $? > ${rcFile}' >${logFile} 2>&1 &`,
+    `# poll ${rcFile} until it records the send|receive exit status`,
     `${bp}btrfs subvolume show ${snapPath}`,
     `${bp}btrfs subvolume show ${received}`,
     `${bp}find ${snapPath} -xdev | wc -l`,
@@ -699,7 +763,7 @@ export function planRelocateSubvol(
     // live mount (e.g. /var) — mounting a ro subvol `-o rw` still rejects writes
     // (EROFS). Flip it rw AFTER the Received-UUID verify above, since clearing
     // ro drops `received_uuid` on modern kernels and would defeat that check.
-    `${bp}btrfs property set ${received} ro false`,
+    `${bp}btrfs property set -f ${received} ro false`,
   ];
   let fstabLine: string | null = null;
   if (args.repoint) {
@@ -1313,20 +1377,51 @@ export const model = {
           // `sync` needs no privilege — run it unprefixed so it matches the plan
           // (the plan lists a bare `sync`), keeping plan ≡ live under `become`.
           await session.run("sync");
-          // send|receive is a single local pipeline; it can run long with no
-          // intermediate output — the session's maxMs bound applies. pipefail so
-          // a failing `send` isn't masked by a succeeding `receive`; in a
-          // subshell so the option doesn't leak into later session commands. Run
-          // directly (NOT via `step`, which would prefix the subshell as a whole,
-          // i.e. `sudo -n ( … )`) — `bp` goes on each pipeline stage instead.
-          const pipe =
-            `( set -o pipefail; ${bp}btrfs send ${snapPath} | ${bp}btrfs receive ${args.targetMount} )`;
-          const sr = await session.run(pipe);
-          if (sr.exitCode !== 0) {
+          // send|receive can copy for minutes with NO console output. Run in the
+          // FOREGROUND and the read blows past idleMs — returning a null exit
+          // code — while the busy shell can't accept the next command (the false
+          // failure this hit in the field: a completed copy reported as failed).
+          // So DETACH it (`nohup … &`), record the pipeline's exit status to a
+          // file, and poll that file with fast commands: the shell stays
+          // responsive and the exit code is captured however long/silent the
+          // copy runs. pipefail so a failing `send` isn't masked by `receive`;
+          // `bp` on each stage (not the subshell as a whole).
+          const { rcFile, logFile } = relocBookkeeping(args.sourceSubvol);
+          await step(`rm -f ${rcFile} ${logFile}`);
+          await session.run(
+            `nohup sh -c 'set -o pipefail; ${bp}btrfs send ${snapPath} | ` +
+              `${bp}btrfs receive ${args.targetMount}; echo $? > ${rcFile}' ` +
+              `>${logFile} 2>&1 & echo __RELOC_STARTED__`,
+          );
+          // Poll for the rc file. Each poll is a fast command that never trips
+          // idleMs; the serial round-trip paces the loop (no on-board sleep,
+          // which could exceed a small idleMs). Bounded so a stuck copy can't
+          // spin forever.
+          let relRc: string | null = null;
+          for (let i = 0; i < RELOC_MAX_POLLS; i++) {
+            const p = await session.run(
+              `cat ${rcFile} 2>/dev/null || echo __RELOC_PENDING__`,
+            );
+            const m = p.stdout.match(/^\s*(\d+)\s*$/m);
+            if (m) {
+              relRc = m[1];
+              break;
+            }
+            await new Promise((r) => setTimeout(r, RELOC_POLL_INTERVAL_MS));
+          }
+          if (relRc === null) {
+            const log =
+              (await session.run(`tail -c 400 ${logFile} 2>/dev/null`)).stdout;
             throw new Error(
-              `\`${pipe}\` failed (rc=${sr.exitCode}): ${
-                sr.stdout.slice(-300)
-              }`,
+              `relocate send|receive did not finish after ${RELOC_MAX_POLLS} ` +
+                `polls; last log tail: ${log.slice(-300)}`,
+            );
+          }
+          if (relRc !== "0") {
+            const log =
+              (await session.run(`tail -c 400 ${logFile} 2>/dev/null`)).stdout;
+            throw new Error(
+              `relocate send|receive failed (rc=${relRc}): ${log.slice(-300)}`,
             );
           }
 
@@ -1352,22 +1447,58 @@ export const model = {
                 }).`,
             );
           }
-          const srcCount = (await step(`find ${snapPath} -xdev | wc -l`)).stdout
-            .trim();
-          const dstCount = (await step(`find ${received} -xdev | wc -l`)).stdout
-            .trim();
+          // Nested subvolumes under the source are NOT crossed by `btrfs send`
+          // (a -r snapshot excludes them), so the received copy legitimately
+          // lacks their mountpoints and contents. Enumerate them so the file /
+          // byte comparison covers only the migrated data (apples-to-apples);
+          // the Received-UUID check above is the authoritative integrity proof.
+          // Paths from `subvolume list -o` are btrfs-root-relative — rebase onto
+          // the source subvol, and SAFE_PATH_RE-gate before interpolating.
+          const srcSubvolFsPath = (await step(
+            `btrfs subvolume show ${args.sourceSubvol}`,
+          )).stdout.split("\n").map((l) => l.trim())
+            .find((l) => l !== "" && !l.includes(":")) ?? "";
+          const nestedRel = (await step(
+            `btrfs subvolume list -o ${args.sourceSubvol}`,
+          )).stdout.split("\n")
+            .map((l) => l.match(/\spath\s+(\S.*?)\s*$/)?.[1])
+            .filter((p): p is string => Boolean(p))
+            .map((p) =>
+              srcSubvolFsPath && p.startsWith(`${srcSubvolFsPath}/`)
+                ? p.slice(srcSubvolFsPath.length + 1)
+                : p
+            )
+            .filter((p) =>
+              p.length > 0 && !p.includes("..") && SAFE_PATH_RE.test(p)
+            );
+          const nestedNote = nestedRel.length
+            ? ` after excluding nested subvols [${nestedRel.join(", ")}]`
+            : "";
+
+          const srcCount = (await step(findCountExcluding(snapPath, nestedRel)))
+            .stdout.trim();
+          const dstCount = (await step(findCountExcluding(received, nestedRel)))
+            .stdout.trim();
           if (srcCount !== dstCount) {
             throw new Error(
-              `relocate verify FAILED: file count differs (source ${srcCount}, received ${dstCount}).`,
+              `relocate verify FAILED: file count differs (source ${srcCount}, received ${dstCount})${nestedNote}.`,
             );
           }
-          const srcBytes = (await step(`du -sb ${snapPath} | cut -f1`)).stdout
-            .trim();
-          const dstBytes = (await step(`du -sb ${received} | cut -f1`)).stdout
-            .trim();
+          const srcBytes = (await step(duBytesExcluding(snapPath, nestedRel)))
+            .stdout.trim();
+          const dstBytes = (await step(duBytesExcluding(received, nestedRel)))
+            .stdout.trim();
           if (srcBytes !== dstBytes) {
             throw new Error(
-              `relocate verify FAILED: byte total differs (source ${srcBytes}, received ${dstBytes}).`,
+              `relocate verify FAILED: byte total differs (source ${srcBytes}, received ${dstBytes})${nestedNote}.`,
+            );
+          }
+          if (nestedRel.length) {
+            context.logger.info(
+              "relocate_subvol: {n} nested subvol(s) under {src} were NOT " +
+                "migrated (btrfs send excludes nested subvolumes): {list}. " +
+                "Relocate each separately if it holds data.",
+              { n: nestedRel.length, src: args.sourceSubvol, list: nestedRel },
             );
           }
 
@@ -1375,7 +1506,7 @@ export const model = {
           // writable to serve as a live mount (a ro subvol mounted `-o rw` still
           // rejects writes with EROFS). Flip it rw only AFTER the Received-UUID
           // verify above — clearing ro drops `received_uuid` on modern kernels.
-          await step(`btrfs property set ${received} ro false`);
+          await step(`btrfs property set -f ${received} ro false`);
 
           let fstab: { replaced: number; backup: string } | null = null;
           let fstabLine: string | null = null;
@@ -1421,6 +1552,7 @@ export const model = {
               fstabReplaced: fstab?.replaced ?? null,
               fstabBackup: fstab?.backup ?? null,
               sourcePreserved: true,
+              nestedSubvolsNotMigrated: nestedRel,
             },
           };
         });

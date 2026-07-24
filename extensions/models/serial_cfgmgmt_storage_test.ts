@@ -23,7 +23,9 @@ import {
   confirmMatches,
   ConfirmDeviceSchema,
   deriveSnapshotPath,
+  duBytesExcluding,
   ensureNofail,
+  findCountExcluding,
   findDevice,
   findDiskFor,
   identityMismatches,
@@ -37,6 +39,7 @@ import {
   partitionPath,
   planFormatMount,
   planRelocateSubvol,
+  relocBookkeeping,
   SAFE_LABEL_RE,
   SAFE_MKFS_ARGS_RE,
   SAFE_OPTS_RE,
@@ -516,6 +519,70 @@ Deno.test("planRelocateSubvol send|receive is pipefail-guarded", () => {
   ));
 });
 
+Deno.test("planRelocateSubvol detaches send|receive and polls an rc file", () => {
+  const plan = planRelocateSubvol(facts(), {
+    sourceSubvol: "/var",
+    targetMount: "/mnt/newdisk",
+    repoint: false,
+  });
+  const { rcFile } = relocBookkeeping("/var");
+  const joined = plan.orderedCommands.join("\n");
+  // The copy runs detached (nohup … &) so a long silent copy can't blow past
+  // idleMs into a null exit code, nor block the shell against later commands.
+  assert(
+    plan.orderedCommands.some((c) =>
+      c.startsWith("nohup ") && c.trimEnd().endsWith("&")
+    ),
+    "send|receive must be detached with nohup … &",
+  );
+  // Its exit status is captured to the rc file, and the plan shows the poll.
+  assertStringIncludes(joined, `echo $? > ${rcFile}`);
+  assertStringIncludes(joined, `poll ${rcFile}`);
+});
+
+Deno.test("findCountExcluding prunes nested subvol paths (apples-to-apples count)", () => {
+  // No nested subvols → plain -xdev count.
+  assertEquals(
+    findCountExcluding("/mnt/nvme/.swamp-reloc-var", []),
+    "find /mnt/nvme/.swamp-reloc-var -xdev | wc -l",
+  );
+  // Nested subvol → its mountpoint subtree is pruned so the source count matches
+  // the received copy, which btrfs send left without that mountpoint.
+  const cmd = findCountExcluding("/.swamp-reloc-var", [
+    "lib/machines",
+    "lib/portables",
+  ]);
+  assertStringIncludes(cmd, "find /.swamp-reloc-var -xdev");
+  assertStringIncludes(cmd, "-path /.swamp-reloc-var/lib/machines");
+  assertStringIncludes(cmd, "-path /.swamp-reloc-var/lib/portables");
+  assertStringIncludes(cmd, "-prune -o -print | wc -l");
+  // A trailing slash on root doesn't produce a double slash.
+  assert(!findCountExcluding("/mnt/nvme/", ["x"]).includes("//"));
+});
+
+Deno.test("duBytesExcluding excludes nested paths and uses apparent size", () => {
+  assertEquals(
+    duBytesExcluding("/mnt/nvme/.swamp-reloc-var", []),
+    "du -sb /mnt/nvme/.swamp-reloc-var | cut -f1",
+  );
+  const cmd = duBytesExcluding("/.swamp-reloc-var", ["lib/machines"]);
+  assertStringIncludes(cmd, "--exclude=/.swamp-reloc-var/lib/machines");
+  assertStringIncludes(cmd, "du -sb "); // -b ⇒ apparent size, compression-agnostic
+  assertStringIncludes(cmd, "| cut -f1");
+});
+
+Deno.test("relocBookkeeping derives collision-free paths per source subvol", () => {
+  assertEquals(relocBookkeeping("/var").rcFile, "/tmp/.swamp-reloc_var.rc");
+  assertEquals(
+    relocBookkeeping("/srv/data").rcFile,
+    "/tmp/.swamp-reloc_srv_data.rc",
+  );
+  // Distinct subvols never share a bookkeeping file.
+  assert(
+    relocBookkeeping("/var").rcFile !== relocBookkeeping("/home").rcFile,
+  );
+});
+
 Deno.test("planRelocateSubvol flips the received subvol rw after verify, before fstab", () => {
   const plan = planRelocateSubvol(facts(), {
     sourceSubvol: "/var",
@@ -525,7 +592,7 @@ Deno.test("planRelocateSubvol flips the received subvol rw after verify, before 
   });
   const cmds = plan.orderedCommands;
   const flipIdx = cmds.findIndex((c) =>
-    c.includes("btrfs property set /mnt/newdisk/.swamp-reloc-var ro false")
+    c.includes("btrfs property set -f /mnt/newdisk/.swamp-reloc-var ro false")
   );
   // The received copy must be made writable — a ro subvol mounted `-o rw` still
   // rejects writes (EROFS), so a repointed /var would boot read-only without it.
@@ -548,7 +615,7 @@ Deno.test("planRelocateSubvol flips rw even when repoint=false (usable copy)", (
     repoint: false,
   });
   assert(plan.orderedCommands.some((c) =>
-    c.includes("btrfs property set /mnt/newdisk/.swamp-reloc-var ro false")
+    c.includes("btrfs property set -f /mnt/newdisk/.swamp-reloc-var ro false")
   ));
 });
 
@@ -701,9 +768,9 @@ Deno.test("become: planners prefix privileged commands (btrfs/mkfs/wipefs/find/d
     targetMount: "/mnt/newdisk",
     repoint: false,
   }, "sudo -n ");
-  // both pipeline stages escalated, inside the pipefail subshell
+  // both pipeline stages escalated, inside the detached pipefail sh -c
   assert(rel.orderedCommands.some((c) =>
-    c.includes("( set -o pipefail; sudo -n btrfs send") && c.includes("| sudo -n btrfs receive")
+    c.includes("set -o pipefail; sudo -n btrfs send") && c.includes("| sudo -n btrfs receive")
   ));
   assert(rel.orderedCommands.some((c) => c.startsWith("sudo -n btrfs subvolume snapshot")));
   assert(rel.orderedCommands.some((c) => c.startsWith("sudo -n find")));
