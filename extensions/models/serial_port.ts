@@ -887,9 +887,35 @@ async function stopHolder(pid: number | null, ptyLink: string): Promise<void> {
 const encoder = new TextEncoder();
 const POLL_MS = 20;
 
-/** The trailing window a stop-pattern is matched against. */
+/**
+ * Terminal escape sequences a console (getty, shell, readline) interleaves with
+ * real output: CSI (cursor/colour, and DSR cursor-position queries like `ESC[6n`),
+ * OSC (window-title / serial-getty metadata like `OSC 3008`, BEL- or ST-terminated),
+ * the DCS/SOS/PM/APC string families (ST-terminated), and short two-byte escapes
+ * (charset designation `ESC(B`, keypad `ESC=`/`ESC>`). Fedora 43's newer agetty
+ * emits a handshake burst (a `ESC[6n` cursor query plus `OSC 3008` metadata) right
+ * at the `login:`/shell prompt; a raw, end-anchored prompt regex never matches the
+ * polluted tail, so login detection must scrub these first.
+ */
+export const ESCAPE_RE =
+  // deno-lint-ignore no-control-regex -- \x1b (ESC) drives every escape class.
+  /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b[P^_X][\s\S]*?\x1b\\|\x1b[ -/]*[\x30-\x7e]/g;
+
+/** Remove every terminal escape sequence (see {@link ESCAPE_RE}) from `s`. */
+export function stripEscapes(s: string): string {
+  return s.replace(ESCAPE_RE, "");
+}
+
+/**
+ * The trailing window a stop-pattern is matched against. Escape sequences and CR
+ * are scrubbed so an end-anchored prompt regex matches the real prompt tail even
+ * when a getty/shell has interleaved a cursor-query or OSC handshake (F43 agetty)
+ * — this is the ONE place every `drainUntil`/`loginOn` stop test flows through, so
+ * escape tolerance lives here rather than being re-derived per caller.
+ */
 function stopWindow(output: string): string {
-  return output.length > STOP_TAIL ? output.slice(-STOP_TAIL) : output;
+  const tail = output.length > STOP_TAIL ? output.slice(-STOP_TAIL) : output;
+  return stripEscapes(tail).replace(/\r/g, "");
 }
 
 /**

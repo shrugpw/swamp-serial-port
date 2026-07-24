@@ -31,15 +31,12 @@ import {
   type SerialPort,
   sessionLinkLive,
   sessionPtyPath,
+  stripEscapes,
   withPort,
 } from "./serial_port.ts";
 
 /** Framing grammar, e.g. 8N1. Mirrors the serial-port model. */
 const FRAMING_RE = /^[5-8][NEO][12]$/;
-
-/** CSI / bracketed-paste escape sequences a console interleaves with output. */
-// deno-lint-ignore no-control-regex -- \x1b (ESC) is the ANSI escape we strip.
-export const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
 /** Matches the trailing shell-prompt line after right-trim (…`~]$`, `#`, `>`). */
 const PROMPT_LINE_RE = /[#$>]\s*$/;
@@ -131,7 +128,7 @@ export function cleanOutput(
   command: string,
   promptLineRe: RegExp = PROMPT_LINE_RE,
 ): string {
-  const noAnsi = raw.replace(ANSI_RE, "").replace(/\r/g, "");
+  const noAnsi = stripEscapes(raw).replace(/\r/g, "");
   const cmd = command.trim();
   const lines = noAnsi.split("\n").map((l) => l.replace(/\s+$/, ""));
   const kept: string[] = [];
@@ -156,12 +153,26 @@ export function cleanOutput(
   return kept.join("\n");
 }
 
-/** Split a cleaned, RC-sentinel-terminated capture into stdout + exit code. */
+/**
+ * Split a cleaned, RC-sentinel-terminated capture into stdout + exit code.
+ *
+ * The sentinel is the command's true end-of-output marker, so stdout is
+ * everything BEFORE it — never merely the capture with the sentinel token
+ * deleted. `drainUntil` stops the read once `RC_RE` matches but returns the
+ * whole buffer, so the same final chunk can carry post-sentinel bytes: the
+ * shell prompt that follows. A *full* prompt is dropped by {@link cleanOutput}'s
+ * `PROMPT_LINE_RE`, but a **partial** prompt caught mid-emit (`[user@host ~`,
+ * no closing `]$ `) matches nothing and would otherwise bleed into stdout — and
+ * when that stdout is spliced back into a shell command (e.g. a captured
+ * `mktemp -d` path), the embedded newline+prompt fragment corrupts every
+ * downstream command. Truncating at the sentinel discards anything after it
+ * regardless of shape, so no trailing prompt noise can survive.
+ */
 export function splitExitCode(cleaned: string): CommandResult {
   const m = cleaned.match(RC_RE);
   const exitCode = m ? Number(m[1]) : null;
-  const stdout = cleaned
-    .replace(RC_RE, "")
+  const beforeSentinel = m ? cleaned.slice(0, m.index) : cleaned;
+  const stdout = beforeSentinel
     .replace(/\n[ \t]*$/, "")
     .replace(/^[ \t]*\n/, "");
   return { stdout: stdout.replace(/\s+$/, ""), exitCode };

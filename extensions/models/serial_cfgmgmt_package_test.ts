@@ -67,4 +67,13 @@ Deno.test("installCommand is manager-appropriate and shell-safe", () => {
     installCommand("dnf", "htop; rm -rf /"),
     "dnf install -y htoprm-rf",
   );
+  // become escalates the command; the name is still sanitized under sudo.
+  assertEquals(
+    installCommand("dnf", "htop", "sudo -n "),
+    "sudo -n dnf install -y htop",
+  );
+  assertEquals(
+    installCommand("dnf", "htop; rm -rf /", "sudo -n "),
+    "sudo -n dnf install -y htoprm-rf",
+  );
 });

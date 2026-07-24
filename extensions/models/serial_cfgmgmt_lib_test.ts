@@ -98,6 +98,16 @@ Deno.test("cleanOutput keeps multi-line stdout intact", () => {
   assertEquals(cleanOutput(raw, "cat file"), "ID=fedora\nVERSION_ID=42");
 });
 
+Deno.test("cleanOutput strips the F43 agetty OSC/DSR burst (#7)", () => {
+  // F43's agetty interleaves a DSR cursor query (CSI) and OSC-3008 metadata
+  // (BEL-terminated) — the OSC escaped the old CSI-only strip and leaked into
+  // stdout and the prompt tail. The consolidated scrub removes both.
+  const burst = "\x1b[6n\x1b]3008;serial-getty@ttyS0.service\x07";
+  const raw = "cat /etc/os-release\r\nVERSION_ID=43\r\n[fedora@bpif3-004 ~]$ " +
+    burst;
+  assertEquals(cleanOutput(raw, "cat /etc/os-release"), "VERSION_ID=43");
+});
+
 Deno.test("cleanOutput drops a residual prompt glued onto the echoed command", () => {
   // A prompt left un-drained by loginOn glues onto the pty echo of the next
   // command; the real output follows. Only "fedora" should survive.
@@ -117,6 +127,25 @@ Deno.test("splitExitCode extracts the RC sentinel and strips it from stdout", ()
     stdout: "no sentinel here",
     exitCode: null,
   });
+});
+
+Deno.test("splitExitCode truncates at the sentinel, dropping a trailing partial prompt", () => {
+  // Regression: `drainUntil` stops on the RC sentinel but returns the whole
+  // buffer, so the final chunk can carry the next prompt AFTER the sentinel. A
+  // full prompt is dropped by cleanOutput; a partial one (`[user@host ~`, no
+  // closing `]$ `) is not, and previously bled into stdout because splitExitCode
+  // only deleted the sentinel token. Live-observed on a getty: a captured
+  // `mktemp -d` path came back as "/tmp/.swamp-dnf.o1zo5w\n[fedora@bpif3-004 ~",
+  // whose embedded newline then corrupted every downstream command.
+  assertEquals(
+    splitExitCode("/tmp/.swamp-dnf.o1zo5w\n__RC:0:RC__\n[fedora@bpif3-004 ~"),
+    { stdout: "/tmp/.swamp-dnf.o1zo5w", exitCode: 0 },
+  );
+  // Same guarantee for a single scalar (the releaseVersion "42\n[fedora@…" bleed).
+  assertEquals(
+    splitExitCode("42\n__RC:0:RC__\n[fedora@bpif3-004"),
+    { stdout: "42", exitCode: 0 },
+  );
 });
 
 // ── settle ───────────────────────────────────────────────────────────────────

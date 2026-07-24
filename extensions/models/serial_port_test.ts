@@ -8,13 +8,19 @@
  *
  * @module
  */
-import { assertEquals, assertMatch, assertThrows } from "jsr:@std/assert@1";
+import {
+  assert,
+  assertEquals,
+  assertMatch,
+  assertThrows,
+} from "jsr:@std/assert@1";
 import {
   assertAllowedDevice,
   ByteQueue,
   type Clock,
   deviceAllowlistCheck,
   drainUntil,
+  ESCAPE_RE,
   execOn,
   framingArgs,
   isAllowedDevice,
@@ -30,6 +36,7 @@ import {
   sessionPtyPath,
   socatDeviceOpts,
   stripEchoedCommand,
+  stripEscapes,
 } from "./serial_port.ts";
 
 // ── Fakes ───────────────────────────────────────────────────────────────────
@@ -596,4 +603,70 @@ Deno.test("loginOn — wrong credentials report failed", async () => {
   );
   assertEquals(status, "failed");
   assertMatch(transcript, /Login incorrect/);
+});
+
+// ── Escape-sequence scrubbing (the F43 agetty handshake) ─────────────────────
+
+// Fedora 43's newer agetty emits this burst at the login/shell prompt: a DSR
+// cursor-position query (CSI `ESC[6n`) plus `OSC 3008` serial-getty metadata
+// (BEL-terminated). Before the scrub was consolidated into `stopWindow`, this
+// tail defeated every end-anchored prompt regex → `withSession` login threw →
+// the cfgmgmt exec/package methods returned no status on an F43 board.
+const F43_BURST = "\x1b[6n\x1b]3008;serial-getty@ttyS0.service\x07";
+
+Deno.test("stripEscapes — removes CSI, OSC (BEL+ST), DCS and charset escapes", () => {
+  // CSI colour + DSR query, OSC (both terminators), a DCS string, keypad/charset.
+  assertEquals(stripEscapes("\x1b[0m\x1b[6nhi"), "hi");
+  assertEquals(stripEscapes("a\x1b]0;title\x07b"), "ab");
+  assertEquals(stripEscapes("a\x1b]52;c;x\x1b\\b"), "ab"); // ST-terminated OSC
+  assertEquals(stripEscapes("a\x1bP1;2q...\x1b\\b"), "ab"); // DCS
+  assertEquals(stripEscapes("\x1b(B\x1b=text"), "text"); // charset + keypad
+  assertEquals(
+    stripEscapes("[fedora@host ~]$ " + F43_BURST),
+    "[fedora@host ~]$ ",
+  );
+  // Real text with no escapes is untouched.
+  assertEquals(stripEscapes("plain login: "), "plain login: ");
+  // Guard the regex is global (no leftover lastIndex state between calls).
+  ESCAPE_RE.lastIndex = 5;
+  assertEquals(stripEscapes("\x1b[6nx"), "x");
+});
+
+Deno.test("loginOn — tolerates the F43 agetty escape burst at every prompt (#7)", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(
+    [
+      "\r\nbpif3-004 login: " + F43_BURST,
+      "Password: " + F43_BURST,
+      "\r\nLast login: ...\r\n[fedora@bpif3-004 ~]$ " + F43_BURST,
+    ],
+    clock,
+  );
+  const { status } = await loginOn(
+    port,
+    {
+      username: "fedora",
+      password: "hunter2",
+      lineEnding: "\n",
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(status, "ok");
+  assertEquals(port.writes, ["\n", "fedora\n", "hunter2\n"]);
+});
+
+Deno.test("drainUntil — stopRegex matches a prompt trailed by an escape burst", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(
+    ["boot noise\r\n", "[fedora@bpif3-004 ~]$ " + F43_BURST],
+    clock,
+  );
+  const { matched } = await drainUntil(
+    port,
+    { idleMs: 300, maxMs: 5000, stopRegex: /[$#>] $/ },
+    clock,
+  );
+  assert(matched);
 });
