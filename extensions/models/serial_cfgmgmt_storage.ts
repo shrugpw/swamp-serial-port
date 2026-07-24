@@ -694,6 +694,12 @@ export function planRelocateSubvol(
     `${bp}find ${received} -xdev | wc -l`,
     `${bp}du -sb ${snapPath} | cut -f1`,
     `${bp}du -sb ${received} | cut -f1`,
+    // `btrfs receive` always lands the copy read-only (it needs the ro flag to
+    // stamp `received_uuid`). A relocated subvol must be writable to serve as a
+    // live mount (e.g. /var) — mounting a ro subvol `-o rw` still rejects writes
+    // (EROFS). Flip it rw AFTER the Received-UUID verify above, since clearing
+    // ro drops `received_uuid` on modern kernels and would defeat that check.
+    `${bp}btrfs property set ${received} ro false`,
   ];
   let fstabLine: string | null = null;
   if (args.repoint) {
@@ -1364,6 +1370,12 @@ export const model = {
               `relocate verify FAILED: byte total differs (source ${srcBytes}, received ${dstBytes}).`,
             );
           }
+
+          // `btrfs receive` lands the copy read-only; a relocated subvol must be
+          // writable to serve as a live mount (a ro subvol mounted `-o rw` still
+          // rejects writes with EROFS). Flip it rw only AFTER the Received-UUID
+          // verify above — clearing ro drops `received_uuid` on modern kernels.
+          await step(`btrfs property set ${received} ro false`);
 
           let fstab: { replaced: number; backup: string } | null = null;
           let fstabLine: string | null = null;

@@ -516,6 +516,42 @@ Deno.test("planRelocateSubvol send|receive is pipefail-guarded", () => {
   ));
 });
 
+Deno.test("planRelocateSubvol flips the received subvol rw after verify, before fstab", () => {
+  const plan = planRelocateSubvol(facts(), {
+    sourceSubvol: "/var",
+    targetMount: "/mnt/newdisk",
+    repoint: true,
+    finalMountpoint: "/var",
+  });
+  const cmds = plan.orderedCommands;
+  const flipIdx = cmds.findIndex((c) =>
+    c.includes("btrfs property set /mnt/newdisk/.swamp-reloc-var ro false")
+  );
+  // The received copy must be made writable — a ro subvol mounted `-o rw` still
+  // rejects writes (EROFS), so a repointed /var would boot read-only without it.
+  assert(flipIdx >= 0, "ro-flip must be emitted");
+  // It must come AFTER the Received-UUID verify (subvolume show of the received
+  // copy) — flipping ro clears received_uuid on modern kernels.
+  const verifyIdx = cmds.findIndex((c) =>
+    c.includes("btrfs subvolume show /mnt/newdisk/.swamp-reloc-var")
+  );
+  assert(verifyIdx >= 0 && flipIdx > verifyIdx, "ro-flip must follow verify");
+  // And BEFORE the fstab repoint, so the mount lands on a writable subvol.
+  const fstabIdx = cmds.findIndex((c) => c.includes("/etc/fstab"));
+  assert(fstabIdx >= 0 && flipIdx < fstabIdx, "ro-flip must precede fstab");
+});
+
+Deno.test("planRelocateSubvol flips rw even when repoint=false (usable copy)", () => {
+  const plan = planRelocateSubvol(facts(), {
+    sourceSubvol: "/var",
+    targetMount: "/mnt/newdisk",
+    repoint: false,
+  });
+  assert(plan.orderedCommands.some((c) =>
+    c.includes("btrfs property set /mnt/newdisk/.swamp-reloc-var ro false")
+  ));
+});
+
 // ————————————————————————————————————————————————————————————————
 // Review-fix regression tests (cycle 2)
 // ————————————————————————————————————————————————————————————————
