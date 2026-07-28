@@ -999,9 +999,17 @@ export async function execOn(
     { idleMs: opts.idleMs, maxMs: opts.maxMs, stopRegex: opts.prompt },
     clock,
   );
+  // Scrub terminal noise the console interleaves with real stdout — CSI/OSC
+  // escapes (colour, DSR cursor queries, the F43 agetty OSC-3008 burst, and
+  // shell-integration OSC-133/633 prompt metadata) and CRs — from the FULL
+  // assembled buffer so multi-line OSC sequences match as one. Doing this
+  // BEFORE stripEchoedCommand also repairs the echo strip: a bracketed-paste
+  // shell prefixes the echoed line with `ESC[?2004l`, so `startsWith(command)`
+  // only holds once the escapes are gone.
+  const scrubbed = stripEscapes(output).replace(/\r/g, "");
   const cleaned = opts.stripEcho
-    ? stripEchoedCommand(output, opts.command)
-    : output;
+    ? stripEchoedCommand(scrubbed, opts.command)
+    : scrubbed;
   return { output: cleaned, matchedPrompt: matched };
 }
 

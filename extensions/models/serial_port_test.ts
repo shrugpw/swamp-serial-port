@@ -498,6 +498,39 @@ Deno.test("execOn — keeps the echo when stripEcho is false", async () => {
   assertMatch(output, /^echo hi/);
 });
 
+Deno.test("execOn — scrubs bracketed-paste + OSC shell-integration noise", async () => {
+  const clock = new FakeClock();
+  // A bracketed-paste bash with shell-integration (OSC 633) wraps the echo and
+  // glues OSC prompt metadata onto the response — the exact garbage a Fedora
+  // console leaks into `execResult.output`.
+  const port = new FakePort(
+    [
+      "\x1b[?2004ltrue\r\n",
+      "hello\r\n",
+      "\x1b]633;A\x07[fedora@localhost ~]$ \x1b[?2004h",
+    ],
+    clock,
+  );
+  const { output, matchedPrompt } = await execOn(
+    port,
+    {
+      command: "true",
+      lineEnding: "\n",
+      prompt: /\$ $/,
+      idleMs: 500,
+      maxMs: 10000,
+      stripEcho: true,
+    },
+    clock,
+  );
+  assertEquals(matchedPrompt, true);
+  // No escape bytes survive, and the echoed command is gone (it only strips
+  // once the leading `ESC[?2004l` is scrubbed).
+  assertEquals(output.includes("\x1b"), false);
+  assertEquals(output.includes("\r"), false);
+  assertMatch(output, /^hello\n\[fedora@localhost ~\]\$ $/);
+});
+
 // ── scrubSecret ─────────────────────────────────────────────────────────────
 
 Deno.test("scrubSecret — redacts the password wherever it appears", () => {
