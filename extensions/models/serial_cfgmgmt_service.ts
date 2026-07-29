@@ -100,7 +100,15 @@ function actionMethod(action: Action) {
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/service",
-  version: "2026.07.22.2",
+  version: "2026.07.28.1",
+  upgrades: [
+    {
+      toVersion: "2026.07.28.1",
+      description:
+        "Version-align with serial-port 2026.07.28.1 release; no schema change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: z.object({ ...ConnectionGlobals }),
   resources: {
     service: {

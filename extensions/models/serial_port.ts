@@ -1336,7 +1336,9 @@ export function ubootSetenvLine(name: string, value: string): string {
  * "Unknown command"); a flash-write failure in `saveenv` prints "Failed".
  */
 export function ubootErrorIn(output: string): string | null {
-  const m = output.match(/##\s*Error[^\n]*|Unknown command[^\n]*|\bFailed\b[^\n]*/i);
+  const m = output.match(
+    /##\s*Error[^\n]*|Unknown command[^\n]*|\bFailed\b[^\n]*/i,
+  );
   return m ? m[0].trim() : null;
 }
 
@@ -1361,7 +1363,15 @@ export function parseUbootVar(output: string, name: string): string | null {
 /** Model definition for the @shrug/serial-port USB-UART model type. */
 export const model = {
   type: "@shrug/serial-port",
-  version: "2026.07.29.1",
+  version: "2026.07.28.1",
+  upgrades: [
+    {
+      toVersion: "2026.07.28.1",
+      description:
+        "Add uboot_setenv method (U-Boot env provisioning); no globalArguments schema change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   globalArguments: GlobalArgsSchema,
   resources: {
     port: {
@@ -1892,7 +1902,9 @@ export const model = {
         );
         if (!ok) {
           const detail = mismatches.length > 0
-            ? mismatches.map((m) => `${m.name}: expected ${m.expected}, got ${m.actual}`)
+            ? mismatches.map((m) =>
+              `${m.name}: expected ${m.expected}, got ${m.actual}`
+            )
               .join("; ")
             : "a setenv/saveenv step reported an error — see the ubootEnv record";
           throw new Error(
