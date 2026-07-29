@@ -29,6 +29,7 @@ import {
   makeDirectTransport,
   makeSubprocessTransport,
   mergeConfig,
+  parseUbootVar,
   scrubSecret,
   selectTransport,
   sendLine,
@@ -37,6 +38,8 @@ import {
   socatDeviceOpts,
   stripEchoedCommand,
   stripEscapes,
+  ubootErrorIn,
+  ubootSetenvLine,
 } from "./serial_port.ts";
 
 // ── Fakes ───────────────────────────────────────────────────────────────────
@@ -702,4 +705,62 @@ Deno.test("drainUntil — stopRegex matches a prompt trailed by an escape burst"
     clock,
   );
   assert(matched);
+});
+
+// ── U-Boot env helpers ──────────────────────────────────────────────────────
+
+Deno.test("ubootSetenvLine — single-quotes the value so ${…} is stored literally", () => {
+  assertEquals(
+    ubootSetenvLine("fdt_addr_r", "0x31000000"),
+    "setenv fdt_addr_r '0x31000000'",
+  );
+  const bootcmd =
+    "nvme scan; load nvme 0:2 ${fdt_addr_r} dtb/spacemit/k1-bananapi-f3.dtb; " +
+    "bootefi ${kernel_addr_r} ${fdt_addr_r}";
+  assertEquals(
+    ubootSetenvLine("bootcmd", bootcmd),
+    `setenv bootcmd '${bootcmd}'`,
+  );
+});
+
+Deno.test("ubootSetenvLine — rejects a bad name", () => {
+  assertThrows(() => ubootSetenvLine("2bad", "x"), Error, "Invalid U-Boot");
+  assertThrows(() => ubootSetenvLine("has space", "x"), Error, "Invalid U-Boot");
+});
+
+Deno.test("ubootSetenvLine — rejects a value with a single quote or newline", () => {
+  assertThrows(
+    () => ubootSetenvLine("x", "it's"),
+    Error,
+    "single quote",
+  );
+  assertThrows(() => ubootSetenvLine("x", "a\nb"), Error, "newline");
+});
+
+Deno.test("ubootErrorIn — flags ## Error / Unknown command / Failed", () => {
+  assertEquals(
+    ubootErrorIn('## Error: "foo" not defined'),
+    '## Error: "foo" not defined',
+  );
+  assertEquals(ubootErrorIn("Unknown command 'setnv' - try 'help'"), "Unknown command 'setnv' - try 'help'");
+  assertMatch(ubootErrorIn("Writing to MMC(2)... Failed!") ?? "", /Failed/);
+});
+
+Deno.test("ubootErrorIn — null on clean setenv/saveenv output", () => {
+  assertEquals(ubootErrorIn(""), null);
+  assertEquals(ubootErrorIn("Saving Environment to MMC... Writing to MMC(2)... OK"), null);
+});
+
+Deno.test("parseUbootVar — extracts the value after name=, splitting on first =", () => {
+  assertEquals(parseUbootVar("fdt_addr_r=0x31000000\n=> ", "fdt_addr_r"), "0x31000000");
+  // A value that itself contains '=' (root=UUID=…) is returned whole.
+  assertEquals(
+    parseUbootVar("bootargs=console=ttyS0,115200 root=UUID=abc\n", "bootargs"),
+    "console=ttyS0,115200 root=UUID=abc",
+  );
+});
+
+Deno.test("parseUbootVar — null when the var is undefined", () => {
+  assertEquals(parseUbootVar('## Error: "bootcmd" not defined', "bootcmd"), null);
+  assertEquals(parseUbootVar("other=1\n", "bootcmd"), null);
 });

@@ -265,6 +265,29 @@ const CaptureReadResourceSchema = z.object({
   data: z.string().describe("The captured console bytes, base64-encoded."),
 });
 
+const UbootEnvResourceSchema = z.object({
+  device: z.string(),
+  ranAt: z.iso.datetime(),
+  vars: z.array(z.object({ name: z.string(), value: z.string() })).describe(
+    "The variables this run set, in the order they were applied.",
+  ),
+  saved: z.boolean().describe("Whether `saveenv` was run to persist the env."),
+  verified: z.boolean().describe(
+    "Whether each variable was read back with `printenv` and compared.",
+  ),
+  steps: z.array(z.object({
+    step: z.string(),
+    ok: z.boolean(),
+    output: z.string(),
+  })).describe("Per-command transcript (setenv / saveenv / printenv)."),
+  mismatches: z.array(z.object({
+    name: z.string(),
+    expected: z.string(),
+    actual: z.string(),
+  })).describe("Variables whose read-back value did not match (verify only)."),
+  ok: z.boolean(),
+});
+
 // ── Device allow-list ───────────────────────────────────────────────────────
 
 /** True when `device` is a real serial tty path this model may drive. */
@@ -1274,12 +1297,71 @@ async function maybeRotate(
   };
 }
 
+// ── U-Boot env helpers (hardware-agnostic, unit-tested) ─────────────────────
+
+/** A U-Boot variable name: a letter/underscore start, then word chars or dots. */
+const UBOOT_NAME_RE = /^[A-Za-z_][\w.]*$/;
+
+/**
+ * Build a `setenv <name> '<value>'` line for the U-Boot console. The value is
+ * single-quoted so the U-Boot parser treats spaces and `;` as part of the value
+ * (not command separators) AND does not expand `$`/`${…}` at set time — a
+ * `bootcmd` that dereferences `${fdt_addr_r}` is stored literally and expanded
+ * when it runs. U-Boot's simple parser cannot escape a single quote inside a
+ * single-quoted string, so a value containing one (or a newline) is rejected
+ * rather than silently truncated.
+ */
+export function ubootSetenvLine(name: string, value: string): string {
+  if (!UBOOT_NAME_RE.test(name)) {
+    throw new Error(
+      `Invalid U-Boot variable name ${JSON.stringify(name)} ` +
+        `(expected a letter/underscore start, then word chars or dots).`,
+    );
+  }
+  if (value.includes("'")) {
+    throw new Error(
+      `U-Boot value for ${name} contains a single quote, which cannot be ` +
+        `safely single-quoted for setenv.`,
+    );
+  }
+  if (/[\r\n]/.test(value)) {
+    throw new Error(`U-Boot value for ${name} contains a newline.`);
+  }
+  return `setenv ${name} '${value}'`;
+}
+
+/**
+ * The U-Boot error snippet in `output`, or null when none is present. U-Boot
+ * reports command failures with a `## Error` banner (and, for a bad command,
+ * "Unknown command"); a flash-write failure in `saveenv` prints "Failed".
+ */
+export function ubootErrorIn(output: string): string | null {
+  const m = output.match(/##\s*Error[^\n]*|Unknown command[^\n]*|\bFailed\b[^\n]*/i);
+  return m ? m[0].trim() : null;
+}
+
+/**
+ * Parse a `printenv <name>` response and return the stored value, or null when
+ * the variable is unset / not found (U-Boot prints `## Error: "x" not defined`).
+ * The echoed command is expected to already be stripped (execOn stripEcho). The
+ * value is the remainder of the `name=…` line — U-Boot prints it on a single
+ * line, and CR has already been scrubbed upstream.
+ */
+export function parseUbootVar(output: string, name: string): string | null {
+  if (/##\s*Error/i.test(output)) return null;
+  const prefix = `${name}=`;
+  for (const line of output.split("\n")) {
+    if (line.startsWith(prefix)) return line.slice(prefix.length);
+  }
+  return null;
+}
+
 // ── Model ───────────────────────────────────────────────────────────────────
 
 /** Model definition for the @shrug/serial-port USB-UART model type. */
 export const model = {
   type: "@shrug/serial-port",
-  version: "2026.07.22.2",
+  version: "2026.07.29.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     port: {
@@ -1324,6 +1406,13 @@ export const model = {
       schema: CaptureReadResourceSchema,
       lifetime: "infinite" as const,
       garbageCollection: 10,
+    },
+    ubootEnv: {
+      description:
+        "Result of a uboot_setenv run (vars set, saveenv, and read-back verification).",
+      schema: UbootEnvResourceSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 20,
     },
   },
   // Fail fast (before any port open) if a console-writing method is aimed at a
@@ -1658,6 +1747,158 @@ export const model = {
             transcript: result.transcript,
           },
         );
+        return { dataHandles: [handle] };
+      },
+    },
+    uboot_setenv: {
+      description:
+        "At the U-Boot prompt (`=> `, not a getty), set one or more environment variables with `setenv`, optionally `saveenv` to persist them, and read each back with `printenv` to verify. Values are single-quoted so spaces/`;`/`${…}` are stored literally (U-Boot expands `${…}` at run time). Idempotent and reusable across boards — pass board-specific paths (DTB, grub EFI, partitions) as the variable values. Run against a live U-Boot; not for a booted OS shell.",
+      arguments: z.object({
+        vars: z.record(z.string(), z.string()).describe(
+          "U-Boot variables to set as name→value, applied in insertion order. Each becomes `setenv <name> '<value>'`. A value cannot contain a single quote or newline.",
+        ),
+        save: z.boolean().default(true).describe(
+          "Run `saveenv` after setting, persisting the env to the board's storage (eMMC/SPI).",
+        ),
+        verify: z.boolean().default(true).describe(
+          "Read each variable back with `printenv` and confirm the stored value matches. Robust even under capture (printenv output is newline-terminated).",
+        ),
+        prompt: z.string().default("=>\\s*$").describe(
+          "Regex for the U-Boot prompt. Matching a no-newline prompt over a capture session is best-effort; verification does not rely on it.",
+        ),
+        idleMs: idleMsArg(1000).describe(
+          "Per-command idle timeout. A `setenv` prints nothing, so it stops on idle.",
+        ),
+        maxMs: maxMsArg(15000).describe(
+          "Per-command hard cap. `saveenv` may take a few seconds to write flash.",
+        ),
+        ...OverrideArgs,
+      }),
+      execute: async (
+        args: Overrides & {
+          vars: Record<string, string>;
+          save: boolean;
+          verify: boolean;
+          prompt: string;
+          idleMs: number;
+          maxMs: number;
+        },
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const entries = Object.entries(args.vars);
+        if (entries.length === 0) {
+          throw new Error("uboot_setenv: `vars` is empty — nothing to set.");
+        }
+        // Build (and validate) every setenv line BEFORE opening the port, so a
+        // bad name/value fails fast without half-applying the set.
+        const setLines = entries.map(([name, value]) =>
+          ubootSetenvLine(name, value)
+        );
+        const promptRe = toRegex(args.prompt);
+
+        const { cfg, ioCfg, attached, capturing, ringPath } =
+          await resolveConfig(context, args);
+
+        const steps: Array<{ step: string; ok: boolean; output: string }> = [];
+        const mismatches: Array<
+          { name: string; expected: string; actual: string }
+        > = [];
+        let ok = true;
+
+        await withPort(transportFor(context), ioCfg, async (port) => {
+          // Under capture the drainer owns the PTY slave — read responses forward
+          // from the ring (mirrors exec/login), else two readers split the stream.
+          const rport = capturing && ringPath
+            ? await ringReadPort(port, ringPath)
+            : port;
+          if (attached) await drainStaleOnAttach(rport);
+
+          const runStep = (command: string) =>
+            execOn(rport, {
+              command,
+              lineEnding: cfg.lineEnding,
+              prompt: promptRe,
+              idleMs: args.idleMs,
+              maxMs: args.maxMs,
+              stripEcho: true,
+            });
+
+          // 1. Apply each setenv (silent on success; only errors produce output).
+          for (const line of setLines) {
+            const { output } = await runStep(line);
+            const err = ubootErrorIn(output);
+            if (err) ok = false;
+            steps.push({ step: line, ok: err === null, output });
+          }
+
+          // 2. Persist.
+          if (args.save) {
+            const { output } = await runStep("saveenv");
+            const err = ubootErrorIn(output);
+            if (err) ok = false;
+            steps.push({ step: "saveenv", ok: err === null, output });
+          }
+
+          // 3. Read back and compare (the reliable confirmation).
+          if (args.verify) {
+            for (const [name, value] of entries) {
+              const { output } = await runStep(`printenv ${name}`);
+              const actual = parseUbootVar(output, name);
+              const matched = actual !== null && actual === value;
+              if (!matched) {
+                ok = false;
+                mismatches.push({
+                  name,
+                  expected: value,
+                  actual: actual ?? "<unset / not parsed>",
+                });
+              }
+              steps.push({
+                step: `printenv ${name}`,
+                ok: matched,
+                output,
+              });
+            }
+          }
+        });
+
+        context.logger.info(
+          "uboot_setenv on {device}: {n} var(s), saved={saved}, verified={verified} -> {result}",
+          {
+            device: cfg.device,
+            n: entries.length,
+            saved: args.save,
+            verified: args.verify,
+            result: ok ? "ok" : `FAILED (${mismatches.length} mismatch(es))`,
+          },
+        );
+
+        // Persist the record either way, then fail the run if anything is off.
+        // Keep the handle writeResource returns (dataId/version/tags) — the
+        // engine validates the data artifact from it; a hand-built {name} fails.
+        const handle = await context.writeResource(
+          "ubootEnv",
+          instanceKey("ubootEnv", cfg.device),
+          {
+            device: cfg.device,
+            ranAt: new Date().toISOString(),
+            vars: entries.map(([name, value]) => ({ name, value })),
+            saved: args.save,
+            verified: args.verify,
+            steps,
+            mismatches,
+            ok,
+          },
+        );
+        if (!ok) {
+          const detail = mismatches.length > 0
+            ? mismatches.map((m) => `${m.name}: expected ${m.expected}, got ${m.actual}`)
+              .join("; ")
+            : "a setenv/saveenv step reported an error — see the ubootEnv record";
+          throw new Error(
+            `uboot_setenv did not fully succeed on ${cfg.device}: ${detail}`,
+          );
+        }
         return { dataHandles: [handle] };
       },
     },
