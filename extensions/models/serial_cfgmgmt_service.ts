@@ -100,12 +100,12 @@ function actionMethod(action: Action) {
 
 export const model = {
   type: "@shrug/serial-cfgmgmt/service",
-  version: "2026.07.28.1",
+  version: "2026.10.15.1",
   upgrades: [
     {
-      toVersion: "2026.07.28.1",
+      toVersion: "2026.10.15.1",
       description:
-        "Version-align with serial-port 2026.07.28.1 release; no schema change.",
+        "Version-align with serial-port 2026.10.15.1 release; no schema change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

@@ -1449,12 +1449,12 @@ export function parseUbootVar(output: string, name: string): string | null {
 /** Model definition for the @shrug/serial-port USB-UART model type. */
 export const model = {
   type: "@shrug/serial-port",
-  version: "2026.07.28.1",
+  version: "2026.10.15.1",
   upgrades: [
     {
-      toVersion: "2026.07.28.1",
+      toVersion: "2026.10.15.1",
       description:
-        "Add uboot_setenv method (U-Boot env provisioning); no globalArguments schema change.",
+        "Add send_secret method (redacted vaulted secret-send) + sentSecret resource; no globalArguments schema change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
