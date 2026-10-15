@@ -8,6 +8,9 @@
  * - `establish` — validate + configure the port (stty), probe it, record the
  *   `port` resource. Fails loudly when the port is held by another process.
  * - `send`      — write one line (or raw bytes) to the port.
+ * - `send_secret` — write a vaulted secret line, redacted from the recorded
+ *   resource, transcript, and capture ring (for masked, echo-off prompts such
+ *   as a password-change flow); optionally gated on a `promptBefore`.
  * - `read`      — drain inbound bytes until idle or a cap.
  * - `exec`      — send a command line, read the response until the prompt
  *   returns or the line goes idle. The console-shell primitive.
@@ -45,8 +48,8 @@
  *
  * ## Safety
  *
- * `device` is constrained to real serial tty paths, so `login` cannot be steered
- * to write the vaulted password to an arbitrary terminal. Stop-pattern matching
+ * `device` is constrained to real serial tty paths, so `login`/`send_secret`
+ * cannot be steered to write a vaulted secret to an arbitrary terminal. Stop-pattern matching
  * runs against a bounded suffix of the captured output, and `idleMs`/`maxMs`
  * carry ceilings — bounding both memory and regex work. Cross-instance
  * exclusivity is a documented limitation for one-shot methods (external holders
@@ -176,6 +179,23 @@ const CapturedResourceSchema = z.object({
   device: z.string(),
   capturedAt: z.iso.datetime(),
   output: z.string(),
+});
+
+// NOTE: deliberately carries NO `secret`/`transcript` field. send_secret records
+// only non-sensitive status, so the vaulted secret can never land in run history.
+const SentSecretResourceSchema = z.object({
+  device: z.string(),
+  sentAt: z.iso.datetime(),
+  awaitedPrompt: z.boolean().describe(
+    "Whether a `promptBefore` gate was awaited before sending.",
+  ),
+  matchedPrompt: z.boolean().describe(
+    "Whether the gating prompt matched (true when none was awaited).",
+  ),
+  sent: z.boolean().describe(
+    "Whether the secret line was actually written to the port.",
+  ),
+  bytesWritten: z.number(),
 });
 
 const ExecResourceSchema = z.object({
@@ -1121,6 +1141,72 @@ export async function loginOn(
   return { status, transcript: scrubSecret(transcript, opts.password) };
 }
 
+/**
+ * Write a vaulted secret line to the port WITHOUT the secret landing in any
+ * persisted transcript. A redacting analog of `send` for masked, echo-off
+ * prompts (a password-change flow such as RouterOS `/password`, whose
+ * `old password:` / `new password:` / `repeat new password:` prompts all turn
+ * echo off). When `promptBefore` is given, this first drains until the console's
+ * trailing output matches it, so the write can be gated on the console actually
+ * being ready for the secret; if the prompt never appears within the idle/max
+ * window the secret is NOT sent (`sent: false`) so it cannot be blasted into an
+ * unexpected console state. The remote masks the secret during entry, so it is
+ * not captured inbound; any bytes read while awaiting the prompt are returned as
+ * `transcript` already scrubbed of the secret (belt-and-braces, like `loginOn`).
+ */
+export async function sendSecretOn(
+  port: SerialPort,
+  opts: {
+    secret: string;
+    lineEnding: string;
+    appendNewline: boolean;
+    promptBefore?: RegExp;
+    idleMs: number;
+    maxMs: number;
+  },
+  clock: Clock = realClock,
+): Promise<
+  {
+    sent: boolean;
+    matchedPrompt: boolean;
+    bytesWritten: number;
+    transcript: string;
+  }
+> {
+  let transcript = "";
+  // Vacuously true when no gating prompt is awaited (plain send).
+  let matchedPrompt = true;
+  if (opts.promptBefore) {
+    const phase = await drainUntil(
+      port,
+      { idleMs: opts.idleMs, maxMs: opts.maxMs, stopRegex: opts.promptBefore },
+      clock,
+    );
+    transcript += phase.output;
+    matchedPrompt = opts.promptBefore.test(stopWindow(transcript));
+    if (!matchedPrompt) {
+      // The gate never appeared — refuse to send the secret into an unknown
+      // console state. Return the (scrubbed) transcript for diagnosis.
+      return {
+        sent: false,
+        matchedPrompt: false,
+        bytesWritten: 0,
+        transcript: scrubSecret(transcript, opts.secret),
+      };
+    }
+  }
+  const bytesWritten = await sendLine(port, opts.secret, {
+    lineEnding: opts.lineEnding,
+    appendNewline: opts.appendNewline,
+  });
+  return {
+    sent: true,
+    matchedPrompt,
+    bytesWritten,
+    transcript: scrubSecret(transcript, opts.secret),
+  };
+}
+
 // ── Config resolution ───────────────────────────────────────────────────────
 
 function toRegex(pattern?: string): RegExp | undefined {
@@ -1386,6 +1472,13 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 10,
     },
+    sentSecret: {
+      description:
+        "Record of a send_secret() write (non-sensitive status only; the secret is never stored).",
+      schema: SentSecretResourceSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 10,
+    },
     captured: {
       description: "Output captured by read().",
       schema: CapturedResourceSchema,
@@ -1427,7 +1520,7 @@ export const model = {
   },
   // Fail fast (before any port open) if a console-writing method is aimed at a
   // non-tty path — the mutating surface can never touch an arbitrary terminal.
-  checks: deviceAllowlistCheck(["send", "exec", "login"]),
+  checks: deviceAllowlistCheck(["send", "exec", "login", "send_secret"]),
 
   methods: {
     establish: {
@@ -1520,6 +1613,140 @@ export const model = {
             sentAt: new Date().toISOString(),
           },
         );
+        return { dataHandles: [handle] };
+      },
+    },
+    send_secret: {
+      description:
+        "Write a VAULTED secret line to the port, redacted from everything " +
+        "persisted. A redacting analog of `send` for masked, echo-off prompts " +
+        "(e.g. a RouterOS `/password` flow: `old password:` / `new password:` " +
+        "/ `repeat new password:`, or the first-login `new password>` / " +
+        "`repeat new password>`). The secret is NEVER written to the recorded " +
+        "resource, a transcript, or the capture ring: the resource holds only " +
+        "non-sensitive status (bytesWritten/matchedPrompt/sent), and any ring " +
+        "bytes the far end echoed during the write are redacted in place " +
+        "(redactSecretInRing) exactly as `login` does. Optional `promptBefore` " +
+        "gates the write on the masking prompt appearing; if it never does, the " +
+        "secret is NOT sent and the run fails. The caller must sequence the " +
+        "separate prompts of a multi-step password change as separate " +
+        "send_secret calls.",
+      arguments: z.object({
+        secret: z.string().meta({ sensitive: true }).describe(
+          "The secret line to send, resolved from a vault reference; never a literal. Written to the port but never recorded to the resource, transcript, or capture ring.",
+        ),
+        appendNewline: z.boolean().default(true).describe(
+          "Append the configured line ending. Set false with `raw` to send exact bytes.",
+        ),
+        raw: z.boolean().default(false).describe(
+          "Treat `secret` as an exact payload (implies appendNewline=false).",
+        ),
+        promptBefore: z.string().optional().describe(
+          "Optional regex; wait until the console's trailing output matches it (e.g. `new password:\\s*$`) before sending. If it never appears within the idle/max window, the secret is NOT sent and the run fails.",
+        ),
+        idleMs: idleMsArg(800).describe(
+          "Idle timeout while awaiting `promptBefore` (unused when it is not set).",
+        ),
+        maxMs: maxMsArg(15000).describe(
+          "Hard cap while awaiting `promptBefore` (unused when it is not set).",
+        ),
+        ...OverrideArgs,
+      }),
+      execute: async (
+        args: Overrides & {
+          secret: string;
+          appendNewline: boolean;
+          raw: boolean;
+          promptBefore?: string;
+          idleMs: number;
+          maxMs: number;
+        },
+        context: MethodContext,
+      ): Promise<Handles> => {
+        const { cfg, ioCfg, attached, capturing, ringPath } =
+          await resolveConfig(context, args);
+        const promptRe = toRegex(args.promptBefore);
+        // Under capture the drainer records every raw PTY byte with no scrub of
+        // its own; if the far-end console echoes the secret, it would persist in
+        // the ring. Note the ring end BEFORE the write so we can redact the span
+        // afterwards — same technique as `login` (CAP-2).
+        const redactFrom = capturing && ringPath ? await fileSize(ringPath) : 0;
+        let result;
+        try {
+          result = await withPort(
+            transportFor(context),
+            ioCfg,
+            async (port) => {
+              const rport = capturing && ringPath
+                ? await ringReadPort(port, ringPath)
+                : port;
+              // Settle a held PTY before awaiting the prompt so a stale trailing
+              // prompt from a previous call is not read as this one's gate.
+              if (attached) await drainStaleOnAttach(rport);
+              return sendSecretOn(rport, {
+                secret: args.secret,
+                lineEnding: cfg.lineEnding,
+                appendNewline: args.raw ? false : args.appendNewline,
+                promptBefore: promptRe,
+                idleMs: args.idleMs,
+                maxMs: args.maxMs,
+              });
+            },
+          );
+        } finally {
+          // Offset-preserving in-place redaction of the secret from the ring,
+          // in a `finally` so it runs even when the write throws after the
+          // secret went out. redactSecretInRing never throws. (Mirrors `login`.)
+          if (capturing && ringPath) {
+            const r = await redactSecretInRing(
+              ringPath,
+              redactFrom,
+              args.secret,
+            );
+            if (r.found > 0 && r.ok) {
+              context.logger.info(
+                "Redacted {n} secret occurrence(s) from the capture ring on {device}",
+                { n: r.found, device: cfg.device },
+              );
+            } else if (r.found > 0 && !r.ok) {
+              context.logger.info(
+                "WARNING: secret redaction WRITE FAILED on the capture ring for {device} — the secret may remain in the ring; run session_stop (without keepCapture) to clear it",
+                { device: cfg.device },
+              );
+            }
+          }
+        }
+        context.logger.info(
+          "send_secret on {device}: sent {sent} ({n} bytes), prompt awaited {awaited} matched {matched}",
+          {
+            device: cfg.device,
+            sent: result.sent,
+            n: result.bytesWritten,
+            awaited: promptRe !== undefined,
+            matched: result.matchedPrompt,
+          },
+        );
+        // Record non-sensitive status ONLY — never the secret or a transcript.
+        const handle = await context.writeResource(
+          "sentSecret",
+          instanceKey("sentSecret", cfg.device),
+          {
+            device: cfg.device,
+            sentAt: new Date().toISOString(),
+            awaitedPrompt: promptRe !== undefined,
+            matchedPrompt: result.matchedPrompt,
+            sent: result.sent,
+            bytesWritten: result.bytesWritten,
+          },
+        );
+        if (!result.sent) {
+          throw new Error(
+            `send_secret: the gating prompt ${
+              JSON.stringify(args.promptBefore)
+            } did not appear on ${cfg.device} within the idle/max window; ` +
+              `the secret was NOT sent.`,
+          );
+        }
         return { dataHandles: [handle] };
       },
     },

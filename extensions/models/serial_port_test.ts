@@ -33,6 +33,7 @@ import {
   scrubSecret,
   selectTransport,
   sendLine,
+  sendSecretOn,
   type SerialPort,
   sessionPtyPath,
   socatDeviceOpts,
@@ -639,6 +640,122 @@ Deno.test("loginOn — wrong credentials report failed", async () => {
   );
   assertEquals(status, "failed");
   assertMatch(transcript, /Login incorrect/);
+});
+
+// ── sendSecretOn ─────────────────────────────────────────────────────────────
+
+const TEST_SECRET = "s3cr3t-test-pw";
+
+Deno.test("sendSecretOn — writes the secret line when no prompt is gated", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  const res = await sendSecretOn(
+    port,
+    {
+      secret: TEST_SECRET,
+      lineEnding: "\n",
+      appendNewline: true,
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  // The secret bytes are actually written to the port.
+  assertEquals(port.writes, [TEST_SECRET + "\n"]);
+  assertEquals(res.sent, true);
+  assertEquals(res.matchedPrompt, true); // vacuously true with no gate
+  assertEquals(res.bytesWritten, (TEST_SECRET + "\n").length);
+  assertEquals(res.transcript, "");
+});
+
+Deno.test("sendSecretOn — raw send omits the line ending", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort([], clock);
+  const res = await sendSecretOn(
+    port,
+    {
+      secret: TEST_SECRET,
+      lineEnding: "\n",
+      appendNewline: false,
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(port.writes, [TEST_SECRET]);
+  assertEquals(res.sent, true);
+});
+
+Deno.test("sendSecretOn — waits for promptBefore, then sends", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["\r\nchanging password\r\nnew password: "], clock);
+  const res = await sendSecretOn(
+    port,
+    {
+      secret: TEST_SECRET,
+      lineEnding: "\n",
+      appendNewline: true,
+      promptBefore: /new password:\s*$/,
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(res.matchedPrompt, true);
+  assertEquals(res.sent, true);
+  // The secret is written only after the gating prompt matched.
+  assertEquals(port.writes, [TEST_SECRET + "\n"]);
+});
+
+Deno.test("sendSecretOn — does NOT send when the gating prompt never appears", async () => {
+  const clock = new FakeClock();
+  const port = new FakePort(["\r\nsome unrelated output\r\n"], clock);
+  const res = await sendSecretOn(
+    port,
+    {
+      secret: TEST_SECRET,
+      lineEnding: "\n",
+      appendNewline: true,
+      promptBefore: /new password:\s*$/,
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(res.matchedPrompt, false);
+  assertEquals(res.sent, false);
+  assertEquals(res.bytesWritten, 0);
+  // Nothing was written to the port — the secret stayed out of an unknown state.
+  assertEquals(port.writes, []);
+});
+
+Deno.test("sendSecretOn — secret never appears in the returned transcript (echo scrubbed)", async () => {
+  const clock = new FakeClock();
+  // Contrive a far end that echoes the secret in the pre-send drain window.
+  const port = new FakePort(
+    [`\r\n${TEST_SECRET} (echoed)\r\nnew password: `],
+    clock,
+  );
+  const res = await sendSecretOn(
+    port,
+    {
+      secret: TEST_SECRET,
+      lineEnding: "\n",
+      appendNewline: true,
+      promptBefore: /new password:\s*$/,
+      idleMs: 300,
+      maxMs: 5000,
+    },
+    clock,
+  );
+  assertEquals(res.sent, true);
+  // The returned transcript is scrubbed of the secret.
+  assertEquals(res.transcript.includes(TEST_SECRET), false);
+  assertMatch(res.transcript, /«redacted»/);
+  // And the whole returned record carries no plaintext secret — these are the
+  // exact values the send_secret method persists to the resource, so the
+  // recorded resource cannot contain the secret either.
+  assertEquals(JSON.stringify(res).includes(TEST_SECRET), false);
 });
 
 // ── Escape-sequence scrubbing (the F43 agetty handshake) ─────────────────────
